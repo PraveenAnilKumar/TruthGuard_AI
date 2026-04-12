@@ -1,0 +1,20 @@
+[server]
+# CORS must be true when XSRF protection is enabled (Streamlit requirement)
+enableCORS = true
+enableXsrfProtection = true
+# Large model folders and virtualenvs can overwhelm Streamlit's file watcher on Windows.
+# Disabling it keeps the app stable without affecting any end-user analysis features.
+fileWatcherType = "none"
+# Free server-side session resources faster after the browser disconnects.
+disconnectedSessionTTL = 30
+
+[browser]
+# Security headers
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#6366f1"
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#1e293b"
+textColor = "#f8fafc"
+font = "sans serif"

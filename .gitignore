@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+.env
+.env.*
+
+tfdml_env/
+truth_env/
+truthguard-env/
+
+temp/
+
+datasets/
+models/
+users.json
+venv/
+.venv/

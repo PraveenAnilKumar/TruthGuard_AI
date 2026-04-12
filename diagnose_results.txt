@@ -1,0 +1,116 @@
+
+=================================================================
+  TruthGuard AI -- Startup Diagnostic
+  Python : 3.9.13
+  Folder : D:\TruthGuard_AI
+=================================================================
+
+--- 1. Standard / Fast Libraries ---
+  Note: pandas >2s and sklearn >5s on first import is NORMAL.
+  They are only slow the very first run (no .pyc cache yet).
+  After first run they cache and become fast. Not a blocker.
+
+  Testing os / sys / json / hashlib... OK    (0.06s)
+  Testing numpy... OK    (0.20s)
+  Testing pandas... OK    (0.65s)
+  Testing cv2 (OpenCV)... OK    (0.05s)
+  Testing PIL (Pillow)... OK    (0.00s)
+  Testing plotly... OK    (0.00s)
+  Testing bcrypt... OK    (0.00s)
+  Testing python-dotenv... OK    (0.01s)
+  Testing sklearn... OK    (6.55s)
+  Testing joblib... OK    (0.00s)
+  Testing nltk... OK    (1.86s)
+  Testing requests... OK    (0.45s)
+  Testing tqdm... OK    (0.06s)
+
+--- 2. Optional / Heavy Libraries ---
+  Testing langdetect... OK    (0.04s)
+  Testing googletrans import... OK (0.24s)
+  Testing Translator()... OK (0.03s)
+
+  --- transformers / torch ---
+  IMPORTANT: These are checked WITHOUT importing at module level.
+  If either CRASHES the process (no output after this line),
+  that is the bug. Our fixed files avoid this entirely.
+
+  transformers installed: YES
+  torch installed       : YES
+
+--- 3. TensorFlow (10-60s on first cold Windows run is normal) ---
+  Testing tensorflow... FAILED (6.18s): Traceback (most recent call last):
+  File "d:\TruthGuard_AI\.venv\lib\site-packages\tensorflow\python\pywrap_tensorflow.py", line 73, in <module>
+    from tensorflow.python._pywrap_tensorflow_internal import *
+ImportError: DLL load failed while importing _pywrap_tensorflow_internal: A dynamic link library (DLL) initialization routine failed.
+
+
+Failed to load the native TensorFlow runtime.
+See https://www.tensorflow.org/install/errors for some common causes and solutions.
+If you need help, create an issue at https://github.com/tensorflow/tensorflow/issues and include the entire stack trace above this error message.
+
+--- 4. TruthGuard Singletons (ALL must be <1s with updated files) ---
+  These test whether the updated files are in place.
+  Any result >1s means that file was NOT replaced yet.
+
+  Testing translator_utils... OK (0.00s)
+  Testing sentiment_analyzer... OK (0.01s)
+  Testing fake_news_detector... OK (0.71s)
+  Testing toxicity_detector... OK (0.26s)
+  Testing realtime_verifier... OK (0.33s)
+  Testing deepfake_detector... OK (0.00s)
+
+--- 5. .env File Check ---
+  .env file... FOUND
+  ADMIN_PASSWORD... SET
+
+--- 6. Models Directory ---
+  Found 32 .h5 model file(s):
+    models\deepfake_artifact.h5  (1.7 MB)
+    models\deepfake_best.h5  (242.8 MB)
+    models\deepfake_best_20260304_221415.h5  (18.0 MB)
+    models\deepfake_best_20260305_141711.h5  (18.0 MB)
+    models\deepfake_best_20260313_181335.h5  (83.0 MB)
+    models\deepfake_best_20260314_085649.h5  (20.1 MB)
+    models\deepfake_best_20260314_114039.h5  (31.6 MB)
+    models\deepfake_best_20260314_143711.h5  (31.6 MB)
+    models\deepfake_best_20260314_174701.h5  (24.4 MB)
+    models\deepfake_best_20260314_183448.h5  (43.8 MB)
+    models\deepfake_best_20260314_221951.h5  (0.0 MB)
+    models\deepfake_best_20260314_224942.h5  (0.0 MB)
+    models\deepfake_best_20260314_231819.h5  (0.0 MB)
+    models\deepfake_best_20260314_232906.h5  (0.0 MB)
+    models\deepfake_best_20260314_234544.weights.h5  (24.3 MB)
+    models\deepfake_best_20260315_083629.weights.h5  (43.6 MB)
+    models\deepfake_best_20260315_202503.weights.h5  (43.6 MB)
+    models\deepfake_best_20260324_174848.weights.h5  (87.1 MB)
+    models\deepfake_best_20260324_203052.weights.h5  (112.6 MB)
+    models\deepfake_cnn.h5  (242.8 MB)
+    models\deepfake_mobilenet.h5  (10.8 MB)
+    models\deepfake_simple.h5  (1.2 MB)
+    models\deepfake_trained_20260305_141711.h5  (18.0 MB)
+    models\deepfake_trained_20260314_085649.h5  (20.1 MB)
+    models\deepfake_trained_20260314_114039.h5  (31.6 MB)
+    models\deepfake_trained_20260314_143711.h5  (31.6 MB)
+    models\deepfake_trained_20260314_183448.h5  (43.8 MB)
+    models\deepfake_trained_20260314_234544.weights.h5  (43.6 MB)
+    models\deepfake_trained_20260315_083629.weights.h5  (43.6 MB)
+    models\deepfake_trained_20260315_202503.weights.h5  (43.6 MB)
+    models\deepfake_trained_20260324_174848.weights.h5  (112.6 MB)
+    models\deepfake_trained_20260324_203052.weights.h5  (112.6 MB)
+
+=================================================================
+  SUMMARY
+=================================================================
+  1 BLOCKER(S) found -- fix these before starting:
+    >> Testing tensorflow... FAILED (6.18s): Traceback (most recent call last):
+  File "d:\TruthGuard_AI\.venv\lib\site-packages\tensorflow\python\pywrap_tensorflow.py", line 73, in <module>
+    from tensorflow.python._pywrap_tensorflow_internal import *
+ImportError: DLL load failed while importing _pywrap_tensorflow_internal: A dynamic link library (DLL) initialization routine failed.
+
+
+Failed to load the native TensorFlow runtime.
+See https://www.tensorflow.org/install/errors for some common causes and solutions.
+If you need help, create an issue at https://github.com/tensorflow/tensorflow/issues and include the entire stack trace above this error message.
+
+  Full results saved to: diagnose_results.txt
+=================================================================
