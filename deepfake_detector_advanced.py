@@ -33,6 +33,7 @@ _TORCH_AVAILABLE = None
 _TRANSFORMERS_AVAILABLE = None
 _FACENET_PYTORCH_AVAILABLE = None
 _MEDIAPIPE_AVAILABLE = None
+DEFAULT_DEEPFAKE_MODEL_NAME = "HF_Transformer_V1"
 
 
 def _check_tf():
@@ -354,6 +355,8 @@ class DeepfakeDetectorAdvanced:
         return ranked[:self.max_ensemble_local_models]
 
     def get_preferred_model_name(self) -> Optional[str]:
+        if DEFAULT_DEEPFAKE_MODEL_NAME in self.available_hf_models:
+            return DEFAULT_DEEPFAKE_MODEL_NAME
         specs = self._scan_available_model_files()
         preferred = self._select_preferred_model_spec(specs)
         if preferred:
@@ -363,6 +366,8 @@ class DeepfakeDetectorAdvanced:
         return self.model_names[0] if self.model_names else None
 
     def get_recommended_threshold(self) -> float:
+        if self.get_preferred_model_name() in self.available_hf_models:
+            return 0.5
         specs = self._scan_available_model_files()
         preferred = self._select_preferred_model_spec(specs)
         hinted_threshold = self._get_model_threshold_hint(preferred)
@@ -483,7 +488,7 @@ class DeepfakeDetectorAdvanced:
         import torch
         from transformers import pipeline as hf_pipeline
 
-        target_names = requested_names or ["HF_Transformer_V1"]
+        target_names = requested_names or [DEFAULT_DEEPFAKE_MODEL_NAME]
         device = 0 if torch.cuda.is_available() else -1
 
         for model_key in target_names:

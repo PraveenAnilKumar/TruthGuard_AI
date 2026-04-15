@@ -13,7 +13,7 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, urlparse
 
 import numpy as np
@@ -69,6 +69,24 @@ class RealtimeNewsVerifier:
             'nbcnews.com': 0.88,
             'cnn.com': 0.86,
             'aljazeera.com': 0.85,
+        }
+        self.stance_groups = {
+            "outcome": (
+                {"win", "wins", "won", "victory", "champion", "champions", "beat", "beats", "beating", "defeated", "triumph", "triumphed"},
+                {"lose", "loses", "lost", "eliminated", "collapse", "collapsed", "runner", "runnerup", "runner-up"},
+            ),
+            "approval": (
+                {"approve", "approves", "approved", "pass", "passes", "passed", "backed", "backs", "support", "supports", "supported"},
+                {"reject", "rejects", "rejected", "block", "blocks", "blocked", "oppose", "opposes", "opposed", "veto", "vetoed"},
+            ),
+            "confirmation": (
+                {"confirm", "confirms", "confirmed", "verify", "verifies", "verified", "true"},
+                {"deny", "denies", "denied", "refute", "refutes", "refuted", "false", "fake", "hoax"},
+            ),
+            "trend": (
+                {"increase", "increases", "increased", "rise", "rises", "rose", "higher", "up", "surge", "surged"},
+                {"decrease", "decreases", "decreased", "fall", "falls", "fell", "lower", "down", "drop", "dropped"},
+            ),
         }
 
     def _normalize_whitespace(self, text: str) -> str:
@@ -336,6 +354,68 @@ class RealtimeNewsVerifier:
         except Exception:
             return 0.0
 
+    def _tokenize(self, text: str) -> Set[str]:
+        return set(re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", (text or "").lower()))
+
+    def _negated_hits(self, text: str, terms: Set[str]) -> Set[str]:
+        lowered = (text or "").lower()
+        hits = set()
+        for term in terms:
+            if re.search(
+                rf"\b(?:not|never|no|did not|didn't|does not|doesn't|was not|wasn't|is not|isn't)\b(?:\W+\w+){{0,2}}\W+{re.escape(term)}\b",
+                lowered,
+            ):
+                hits.add(f"not_{term}")
+        return hits
+
+    def _stance_hits(self, text: str, positive_terms: Set[str], negative_terms: Set[str]) -> Tuple[Set[str], Set[str]]:
+        tokens = self._tokenize(text)
+        positive_hits = set(tokens & positive_terms)
+        negative_hits = set(tokens & negative_terms)
+
+        negated_positive_hits = self._negated_hits(text, positive_terms)
+        if negated_positive_hits:
+            positive_hits -= {term.replace("not_", "", 1) for term in negated_positive_hits}
+            negative_hits |= negated_positive_hits
+
+        negated_negative_hits = self._negated_hits(text, negative_terms)
+        if negated_negative_hits:
+            negative_hits -= {term.replace("not_", "", 1) for term in negated_negative_hits}
+            positive_hits |= negated_negative_hits
+
+        return positive_hits, negative_hits
+
+    def _analyze_stance_alignment(self, claim_text: str, candidate_text: str) -> Dict[str, object]:
+        contradiction_groups: List[str] = []
+        support_groups: List[str] = []
+
+        for group_name, (positive_terms, negative_terms) in self.stance_groups.items():
+            claim_pos, claim_neg = self._stance_hits(claim_text, positive_terms, negative_terms)
+            cand_pos, cand_neg = self._stance_hits(candidate_text, positive_terms, negative_terms)
+            if not (claim_pos or claim_neg or cand_pos or cand_neg):
+                continue
+
+            if (claim_pos and cand_neg) or (claim_neg and cand_pos):
+                contradiction_groups.append(group_name)
+            elif (claim_pos and cand_pos) or (claim_neg and cand_neg):
+                support_groups.append(group_name)
+
+        contradiction_penalty = min(0.38 * len(contradiction_groups), 0.68)
+        support_bonus = min(0.05 * len(support_groups), 0.12)
+        stance_status = "neutral"
+        if contradiction_groups:
+            stance_status = "contradictory"
+        elif support_groups:
+            stance_status = "supporting"
+
+        return {
+            "stance_status": stance_status,
+            "contradiction_penalty": contradiction_penalty,
+            "support_bonus": support_bonus,
+            "contradiction_groups": contradiction_groups,
+            "support_groups": support_groups,
+        }
+
     def _deduplicate_results(self, results: List[Dict]) -> List[Dict]:
         deduped = {}
         for item in results:
@@ -405,12 +485,17 @@ class RealtimeNewsVerifier:
 
             body_sim = self._semantic_similarity(claim_text, article_text[:4000]) if article_text else 0.0
             snippet = self._extract_best_matching_snippet(claim_text, article_text) if article_text else ""
+            stance = self._analyze_stance_alignment(
+                claim_text,
+                " ".join(filter(None, [item.get("title", ""), snippet, article_text[:4000]])),
+            )
             score = (
                 0.38 * title_sim +
                 0.32 * body_sim +
                 0.18 * credibility +
                 0.12 * freshness
             )
+            score = max(0.0, min(score + float(stance["support_bonus"]) - float(stance["contradiction_penalty"]), 1.0))
             scored.append({
                 'title': item.get('title', ''),
                 'url': url,
@@ -425,6 +510,12 @@ class RealtimeNewsVerifier:
                 'published': item.get('pub_date', ''),
                 'matched_query': (item.get('queries') or [""])[0],
                 'evidence_snippet': snippet,
+                'article_preview': article_text[:1800] if article_text else "",
+                'stance_status': stance["stance_status"],
+                'contradiction_penalty': float(stance["contradiction_penalty"]),
+                'support_bonus': float(stance["support_bonus"]),
+                'contradiction_groups': stance["contradiction_groups"],
+                'support_groups': stance["support_groups"],
             })
         return scored
 
@@ -434,6 +525,7 @@ class RealtimeNewsVerifier:
                 "consensus_score": 0.0,
                 "verdict_code": "UNVERIFIED",
                 "message": "No matching real-time news found to verify this claim.",
+                "contradiction_score": 0.0,
             }
 
         ordered = sorted(scored_sources, key=lambda item: item["score"], reverse=True)
@@ -447,9 +539,21 @@ class RealtimeNewsVerifier:
         dominance_penalty = 0.08 if domain_counts and max(domain_counts.values()) >= 3 else 0.0
         diversity_bonus = min(unique_domains / 5, 1.0) * 0.14
         corroboration_bonus = min((credible_count + strong_match_count) / 8, 1.0) * 0.16
-        consensus = max(0.0, min(mean_score + diversity_bonus + corroboration_bonus - dominance_penalty, 1.0))
+        contradictory_count = sum(1 for item in top if item.get("stance_status") == "contradictory")
+        supporting_count = sum(1 for item in top if item.get("stance_status") == "supporting")
+        contradiction_score = float(np.mean([item.get("contradiction_penalty", 0.0) for item in top]))
+        consensus = max(
+            0.0,
+            min(mean_score + diversity_bonus + corroboration_bonus - dominance_penalty - contradiction_score, 1.0),
+        )
 
-        if consensus >= 0.72 and credible_count >= 2:
+        if contradictory_count >= max(1, supporting_count) and contradiction_score >= 0.2:
+            verdict = "CONTRADICTED_BY_SOURCES"
+            message = (
+                "Matched reporting appears to contradict the claim on key details, "
+                "even though the same topic or entities were found."
+            )
+        elif consensus >= 0.72 and credible_count >= 2:
             verdict = "VERIFIED_ONLINE"
             message = (
                 f"Claim is supported by {credible_count} highly credible sources across "
@@ -469,6 +573,7 @@ class RealtimeNewsVerifier:
             "consensus_score": consensus,
             "verdict_code": verdict,
             "message": message,
+            "contradiction_score": contradiction_score,
         }
 
     def verify_claim(self, text: str) -> Dict:
@@ -508,6 +613,7 @@ class RealtimeNewsVerifier:
             'verdict_code': consensus_payload['verdict_code'],
             'sources': scored_sources,
             'message': consensus_payload['message'],
+            'contradiction_score': consensus_payload.get('contradiction_score', 0.0),
             'timestamp': datetime.now().isoformat(),
             'search_query': queries[0] if queries else self._extract_query(query_text),
             'search_queries': queries,

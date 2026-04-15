@@ -110,6 +110,7 @@ class FakeNewsDetector:
         self.transformer_model = None
         self.transformer_pipeline = None
         self.transformer_backend = None
+        self._invert_model_labels = False
         self.is_trained = False
         self.model_metadata = {}
         self.available_models = []
@@ -359,6 +360,13 @@ class FakeNewsDetector:
                         match = fallback
         else:
             loaded = self.load_traditional_model(match['path'])
+            if not loaded:
+                logger.warning("Traditional model load failed. Falling back to a transformer model if available.")
+                fallback = next((m for m in self.available_models if m['type'] == 'transformer'), None)
+                if fallback is not None:
+                    loaded = self.load_transformer_model(fallback['path'])
+                    if loaded:
+                        match = fallback
 
         if loaded:
             self.model_metadata['loaded_path'] = match['path']
@@ -398,11 +406,51 @@ class FakeNewsDetector:
             logger.error(f"Realtime verifier unavailable: {e}")
             return None
 
+    def _apply_label_orientation(self, label: str, confidence: float) -> Tuple[str, float]:
+        if label not in {"FAKE", "REAL"}:
+            return label, confidence
+        if self._invert_model_labels:
+            return ("REAL", confidence) if label == "FAKE" else ("FAKE", confidence)
+        return label, confidence
+
+    def _calibrate_label_orientation(self, predictor) -> None:
+        probes = [
+            ("REAL", "Government report confirms the annual budget was released on schedule."),
+            ("REAL", "According to university research, the study was officially published this year."),
+            ("FAKE", "Scientists confirmed the moon is made entirely of cheese."),
+            ("FAKE", "Secret miracle cure shocks doctors and they do not want you to know."),
+        ]
+        self._invert_model_labels = False
+        mismatches = 0
+        try:
+            for expected, sample_text in probes:
+                predicted_label, _ = predictor(sample_text)
+                if predicted_label != expected:
+                    mismatches += 1
+            self._invert_model_labels = mismatches > (len(probes) // 2)
+            if self._invert_model_labels:
+                logger.warning("Loaded fake-news model appears to have inverted label semantics. Auto-correcting outputs.")
+        except Exception as exc:
+            logger.warning(f"Could not calibrate label orientation: {exc}")
+            self._invert_model_labels = False
+
     def load_traditional_model(self, model_path: str) -> bool:
         """Load a trained traditional ML model."""
         try:
             logger.info(f"Loading traditional model from {model_path}")
-            self.model = joblib.load(model_path)
+            loaded_obj = joblib.load(model_path)
+
+            # Some legacy exports contain a whole FakeNewsDetector instance
+            # instead of just the sklearn pipeline. Unwrap those safely.
+            if hasattr(loaded_obj, "model") and getattr(loaded_obj, "model", None) is not None and not hasattr(loaded_obj, "named_steps"):
+                logger.info("Detected wrapped FakeNewsDetector artifact. Extracting inner sklearn pipeline.")
+                self.model = loaded_obj.model
+                if getattr(loaded_obj, "vectorizer", None) is not None:
+                    self.vectorizer = loaded_obj.vectorizer
+                if getattr(loaded_obj, "model_metadata", None):
+                    self.model_metadata = dict(getattr(loaded_obj, "model_metadata", {}) or {})
+            else:
+                self.model = loaded_obj
 
             base = os.path.basename(model_path).replace('.pkl', '')
             patterns = [
@@ -424,8 +472,28 @@ class FakeNewsDetector:
             if hasattr(self.model, 'named_steps') and 'tfidf' in self.model.named_steps:
                 self.vectorizer = self.model.named_steps['tfidf']
 
+            if not hasattr(self.model, 'predict'):
+                logger.error("Loaded traditional artifact does not expose a predict method.")
+                self.model = None
+                self.vectorizer = None
+                return False
+
+            try:
+                smoke_text = ["official report confirms scheduled update"]
+                if hasattr(self.model, 'predict_proba'):
+                    self.model.predict_proba(smoke_text)
+                else:
+                    self.model.predict(smoke_text)
+            except Exception as validation_exc:
+                logger.error(f"Traditional model validation failed: {validation_exc}")
+                self.model = None
+                self.vectorizer = None
+                self.is_trained = False
+                return False
+
             self.is_trained = True
             self.use_transformer = False
+            self._calibrate_label_orientation(self._predict_traditional)
 
             meta_path = model_path.replace('.pkl', '_metadata.json')
             if os.path.exists(meta_path):
@@ -468,6 +536,7 @@ class FakeNewsDetector:
 
             self.use_transformer = True
             self.is_trained = True
+            self._calibrate_label_orientation(self._predict_transformer)
             gc.collect()
 
             meta_path = os.path.join(model_path, 'metrics.json')
@@ -616,6 +685,79 @@ class FakeNewsDetector:
         }
         return (label, conf, clickbait_score, meta)
 
+    def _apply_realtime_adjustment(self, label: str, conf: float, meta: Dict[str, Any], text: str) -> Tuple[str, float]:
+        rt = meta.get('realtime_result')
+        if not rt or rt.get('status') != 'SUCCESS':
+            return label, conf
+
+        consensus = float(rt.get('consensus_score', 0.5) or 0.0)
+        contradiction_score = float(rt.get('contradiction_score', 0.0) or 0.0)
+        verdict_code = str(rt.get('verdict_code', 'UNVERIFIED') or 'UNVERIFIED')
+
+        if verdict_code == 'CONTRADICTED_BY_SOURCES' or contradiction_score >= 0.2:
+            if label == 'REAL':
+                label = 'FAKE'
+                conf = max(conf, min(0.95, 0.72 + contradiction_score * 0.4))
+                meta['realtime_impact'] = "Reversed REAL label because matched live sources contradicted the claim."
+            else:
+                conf = min(0.99, max(conf, 0.76 + contradiction_score * 0.25))
+                meta['realtime_impact'] = "Suspicion strengthened because matched live sources contradicted the claim."
+            logger.info(f"Label adjusted by contradiction signals for: {text[:50]}...")
+            return label, conf
+
+        if verdict_code == 'VERIFIED_ONLINE' and consensus > 0.7:
+            if label == 'FAKE':
+                if consensus > 0.85:
+                    label = 'REAL'
+                    conf = consensus
+                    meta['realtime_impact'] = "Reversed FAKE label due to strong factual consensus."
+                else:
+                    conf = max(0.5, conf * (1 - consensus))
+                    meta['realtime_impact'] = "Confidence lowered due to conflicting factual reports."
+            else:
+                conf = min(0.99, conf + (consensus * 0.2))
+                meta['realtime_impact'] = "Credibility boosted by strong factual consensus."
+            return label, conf
+
+        if consensus < 0.25:
+            if label == 'REAL':
+                if consensus < 0.1:
+                    label = 'FAKE'
+                    conf = 0.9
+                    meta['realtime_impact'] = "Reversed REAL label: No factual reports found."
+                else:
+                    conf = max(0.5, conf * (consensus + 0.5))
+                    meta['realtime_impact'] = "Confidence lowered due to lack of factual reporting."
+            else:
+                conf = min(0.99, conf + 0.1)
+                meta['realtime_impact'] = "Suspicion confirmed by lack of legitimate reporting."
+
+            logger.info(f"Label adjusted by weak consensus for: {text[:50]}...")
+
+        return label, conf
+
+    def _looks_like_short_claim(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", _coerce_text(text)).strip()
+        words = normalized.split()
+        return bool(normalized) and len(words) <= 18 and len(normalized) <= 180
+
+    def _apply_claim_guard(self, label: str, conf: float, meta: Dict[str, Any], text: str) -> Tuple[str, float]:
+        if label != 'REAL' or not self._looks_like_short_claim(text):
+            return label, conf
+
+        rt = meta.get('realtime_result')
+        if not rt or rt.get('status') != 'SUCCESS':
+            meta['realtime_impact'] = "Short claim could not be corroborated with live reporting, so it was marked unverified."
+            return 'UNVERIFIED', min(conf, 0.6)
+
+        verdict_code = str(rt.get('verdict_code', 'UNVERIFIED') or 'UNVERIFIED')
+        consensus = float(rt.get('consensus_score', 0.0) or 0.0)
+        if verdict_code != 'VERIFIED_ONLINE' or consensus < 0.72:
+            meta['realtime_impact'] = "Short claim was not strongly verified by live reporting, so it was marked unverified."
+            return 'UNVERIFIED', min(conf, max(consensus, 0.58))
+
+        return label, conf
+
     # ── Prediction ─────────────────────────────────────────────────────────────
     def predict(self, text: str, check_realtime: bool = False, use_ensemble: bool = False, requested_models: Optional[List[str]] = None) -> Tuple[str, float, float, Dict]:
         """
@@ -660,6 +802,9 @@ class FakeNewsDetector:
         ):
             logger.warning("No trained model loaded. Using fallback.")
             label, conf = self._fallback_predict(translated_text)
+            if check_realtime and meta.get('realtime_result'):
+                label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
+            label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
             return (label, conf, clickbait_score, meta)
 
         try:
@@ -671,39 +816,9 @@ class FakeNewsDetector:
             else:
                 label, conf = self._predict_traditional(translated_text)
 
-            # Cross-reference with real-time news consensus
             if check_realtime and meta.get('realtime_result'):
-                rt = meta['realtime_result']
-                if rt.get('status') == 'SUCCESS':
-                    consensus = rt.get('consensus_score', 0.5)
-                    initial_label = label
-
-                    if consensus > 0.7:
-                        if label == 'FAKE':
-                            if consensus > 0.85:
-                                label = 'REAL'
-                                conf = consensus
-                                meta['realtime_impact'] = "Reversed FAKE label due to strong factual consensus."
-                            else:
-                                conf = max(0.5, conf * (1 - consensus))
-                                meta['realtime_impact'] = "Confidence lowered due to conflicting factual reports."
-                        else:
-                            conf = min(0.99, conf + (consensus * 0.2))
-                            meta['realtime_impact'] = "Credibility boosted by strong factual consensus."
-                    elif consensus < 0.25:
-                        if label == 'REAL':
-                            if consensus < 0.1:
-                                label = 'FAKE'
-                                conf = 0.9
-                                meta['realtime_impact'] = "Reversed REAL label: No factual reports found."
-                            else:
-                                conf = max(0.5, conf * (consensus + 0.5))
-                                meta['realtime_impact'] = "Confidence lowered due to lack of factual reporting."
-                        else:
-                            conf = min(0.99, conf + 0.1)
-                            meta['realtime_impact'] = "Suspicion confirmed by lack of legitimate reporting."
-
-                        logger.info(f"Label flipped by real-time consensus for: {text[:50]}...")
+                label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
+            label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
             
             # Aggressive cleanup after heavy operation
             if use_ensemble or requested_models:
@@ -713,6 +828,9 @@ class FakeNewsDetector:
         except Exception as e:
             logger.error(f"Prediction error: {e}")
             label, conf = self._fallback_predict(translated_text)
+            if check_realtime and meta.get('realtime_result'):
+                label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
+            label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
             return (label, conf, clickbait_score, meta)
 
     def _predict_traditional(self, text: str) -> Tuple[str, float]:
@@ -732,12 +850,19 @@ class FakeNewsDetector:
                     proba = self.model.predict_proba([processed])[0]
                     if len(proba) == 2:
                         fake_prob, real_prob = proba[1], proba[0]
-                        return ('FAKE', float(fake_prob)) if fake_prob > real_prob else ('REAL', float(real_prob))
+                        raw_label = 'FAKE' if fake_prob > real_prob else 'REAL'
+                        raw_conf = float(fake_prob) if fake_prob > real_prob else float(real_prob)
+                        return self._apply_label_orientation(raw_label, raw_conf)
                 except Exception as e:
                     logger.warning(f"predict_proba failed, falling back to predict: {e}")
 
             pred = self.model.predict([processed])[0]
-            return ('FAKE' if pred == 1 else 'REAL', 0.95)
+            if isinstance(pred, str):
+                normalized = pred.strip().upper()
+                if normalized in {"FAKE", "REAL"}:
+                    return self._apply_label_orientation(normalized, 0.95)
+            raw_label = 'FAKE' if pred == 1 else 'REAL'
+            return self._apply_label_orientation(raw_label, 0.95)
         except Exception as e:
             logger.error(f"Traditional prediction error: {e}")
             # If it's the 'list' object has no attribute 'strip', it's likely a vectorizer-level exception
@@ -759,10 +884,11 @@ class FakeNewsDetector:
                 label = result['label']
                 score = result['score']
                 if 'LABEL_1' in label or 'FAKE' in label.upper():
-                    return ('FAKE', score)
+                    return self._apply_label_orientation('FAKE', score)
                 elif 'LABEL_0' in label or 'REAL' in label.upper():
-                    return ('REAL', score)
-                return ('FAKE' if score > 0.5 else 'REAL', score)
+                    return self._apply_label_orientation('REAL', score)
+                raw_label = 'FAKE' if score > 0.5 else 'REAL'
+                return self._apply_label_orientation(raw_label, score)
 
             elif self.tokenizer and self.transformer_model:
                 import torch
@@ -773,9 +899,12 @@ class FakeNewsDetector:
                 if probs.shape[-1] == 2:
                     fake_prob = probs[0][1].item()
                     real_prob = probs[0][0].item()
-                    return ('FAKE', fake_prob) if fake_prob > real_prob else ('REAL', real_prob)
+                    raw_label = 'FAKE' if fake_prob > real_prob else 'REAL'
+                    raw_conf = fake_prob if fake_prob > real_prob else real_prob
+                    return self._apply_label_orientation(raw_label, raw_conf)
                 pred = torch.argmax(probs, dim=-1).item()
-                return ('FAKE' if pred == 1 else 'REAL', probs[0][pred].item())
+                raw_label = 'FAKE' if pred == 1 else 'REAL'
+                return self._apply_label_orientation(raw_label, probs[0][pred].item())
             return self._fallback_predict(text)
         except Exception as e:
             logger.error(f"Transformer prediction error: {e}")

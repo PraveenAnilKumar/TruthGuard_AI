@@ -348,6 +348,34 @@ def get_toxicity_visualizer():
     return ToxicityVisualizer
 
 
+def _compact_text(value: str, limit: int) -> str:
+    cleaned = " ".join((value or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    trimmed = cleaned[:limit].rsplit(" ", 1)[0].strip()
+    return (trimmed or cleaned[:limit]).rstrip(".,;: ") + "..."
+
+
+def _safe_url(value: str) -> str:
+    value = (value or "").strip()
+    return value if value.startswith(("http://", "https://")) else "#"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_related_article_preview(url: str) -> str:
+    safe_url = _safe_url(url)
+    if safe_url == "#":
+        return ""
+    try:
+        verifier = get_realtime_verifier()
+        if verifier is None:
+            return ""
+        return " ".join((verifier.extract_article_content(safe_url) or "").split())
+    except Exception as exc:
+        logger.warning(f"Could not load related article preview for {safe_url}: {exc}")
+        return ""
+
+
 COMMUNICATION_PAGE = "Communication Analysis"
 LEGACY_PAGE_REDIRECTS = {
     "Sentiment Analysis": COMMUNICATION_PAGE,
@@ -405,17 +433,6 @@ def render_live_news_comparison(rt_result, claim_text):
     sources = rt_result.get("sources", [])
     if not sources:
         return
-
-    def _compact_text(value: str, limit: int) -> str:
-        cleaned = " ".join((value or "").split())
-        if len(cleaned) <= limit:
-            return cleaned
-        trimmed = cleaned[:limit].rsplit(" ", 1)[0].strip()
-        return (trimmed or cleaned[:limit]).rstrip(".,;: ") + "..."
-
-    def _safe_url(value: str) -> str:
-        value = (value or "").strip()
-        return value if value.startswith(("http://", "https://")) else "#"
 
     top_source = sources[0]
     left, right = st.columns([1, 1])
@@ -489,6 +506,95 @@ def render_live_news_comparison(rt_result, claim_text):
         })
     with st.expander("Technical Match Breakdown"):
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def render_article_match_browser(
+    rt_result,
+    widget_namespace="fn_match",
+    section_title="Matching Articles",
+    intro_text=None,
+):
+    """Render a prominent matching-articles section for fake-news verification results."""
+    if not rt_result or rt_result.get("status") == "NO_RESULTS":
+        return
+
+    sources = [
+        source for source in rt_result.get("sources", [])
+        if _safe_url(source.get("url", "")) != "#"
+    ]
+    if not sources:
+        return
+
+    st.markdown(f"### {section_title}")
+    st.caption(
+        intro_text
+        or "Browse the live articles this verification matched against before accepting the verdict."
+    )
+
+    summary_col1, summary_col2, summary_col3 = st.columns(3)
+    with summary_col1:
+        st.metric("Matched Sources", len(sources))
+    with summary_col2:
+        avg_match = float(np.mean([source.get("score", 0.0) for source in sources]))
+        st.metric("Average Match", f"{avg_match:.0%}")
+    with summary_col3:
+        top_credibility = max(source.get("credibility_score", 0.0) for source in sources)
+        st.metric("Top Credibility", f"{top_credibility:.0%}")
+
+    options = list(range(len(sources)))
+    selected_idx = st.selectbox(
+        "Browse matched articles",
+        options=options,
+        format_func=lambda idx: (
+            f"{sources[idx].get('source') or sources[idx].get('domain') or 'Source'}"
+            f" - {_compact_text(sources[idx].get('title', '') or 'Untitled article', 90)}"
+        ),
+        key=f"{widget_namespace}_related_article_idx",
+    )
+    selected = sources[selected_idx]
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    with metric_col1:
+        st.metric("Match Score", f"{selected.get('score', 0.0):.0%}")
+    with metric_col2:
+        st.metric("Credibility", f"{selected.get('credibility_score', 0.0):.0%}")
+    with metric_col3:
+        st.metric("Body Match", f"{selected.get('body_similarity', 0.0):.0%}")
+
+    st.markdown(f"#### {selected.get('title') or 'Untitled article'}")
+    st.caption(
+        f"{selected.get('source') or selected.get('domain') or 'Unknown source'}"
+        f" | {selected.get('published') or 'Publication time unavailable'}"
+    )
+    safe_url = _safe_url(selected.get("url", ""))
+    if safe_url != "#":
+        st.markdown(f"[Open original article]({safe_url})")
+
+    preview_text = " ".join((selected.get("article_preview") or "").split())
+    if not preview_text:
+        preview_text = get_related_article_preview(selected.get("url", ""))
+
+    if preview_text:
+        st.text_area(
+            "Article Preview",
+            value=preview_text,
+            height=260,
+            disabled=True,
+            key=f"{widget_namespace}_article_preview_{selected_idx}",
+        )
+    else:
+        fallback_snippet = selected.get("evidence_snippet") or "No article body preview could be extracted for this match."
+        st.info(_compact_text(fallback_snippet, 360))
+
+
+def render_related_article_viewer(rt_result, widget_namespace="fn_image"):
+    """Backward-compatible wrapper for OCR-based article browsing."""
+    render_article_match_browser(
+        rt_result,
+        widget_namespace=widget_namespace,
+        section_title="Related Articles From Extracted Text",
+        intro_text="Browse the matched live articles found from the text extracted out of the uploaded article image.",
+    )
 
 
 # ============================================================================
@@ -2405,12 +2511,15 @@ elif st.session_state.page == "Fake News Detection":
                 selected_model_idx = 0
                 requested_models = None
             else:
-                default_model_idx = next((i for i, model in enumerate(available_models) if model.get("type") == "random_forest"), 0)
+                default_model_idx = next(
+                    (i for i, model in enumerate(available_models) if model.get("type") == "transformer"),
+                    next((i for i, model in enumerate(available_models) if model.get("type") == "random_forest"), 0),
+                )
                 selected_model_str = st.selectbox("🎯 Active Detection Engine", model_names, index=default_model_idx)
                 selected_model_idx = model_names.index(selected_model_str)
                 requested_models = [available_models[selected_model_idx]['path']]
                 if available_models and available_models[selected_model_idx].get("type") == "transformer":
-                    st.warning("The selected transformer model is heavy. If analysis fails, switch to a Random Forest model for a faster and safer run.")
+                    st.caption("Transformer models are the preferred default here because they are more reliable for direct claim checks.")
                 else:
                     st.caption("Traditional models are the faster default for this page.")
         elif fn_selection_mode == "Full Ensemble":
@@ -2645,6 +2754,9 @@ elif st.session_state.page == "Fake News Detection":
             if res['label'] == 'FAKE':
                 cls, label, sub = "res-danger", "🚨 FABRICATED CONTENT", "Models detected high probability of misinformation."
                 truth_prob = (1 - res['conf'])
+            elif res['label'] == 'UNVERIFIED':
+                cls, label, sub = "res-warn", "⚠️ UNVERIFIED CLAIM", "This short claim was not strongly confirmed by reliable reporting."
+                truth_prob = 0.5
             else:
                 cls, label, sub = "res-safe", "✅ CREDIBLE NEWS", "Content aligns with factual reporting patterns."
                 truth_prob = res['conf']
@@ -2662,8 +2774,27 @@ elif st.session_state.page == "Fake News Detection":
             if res.get('meta') and res['meta'].get('ocr'):
                 render_ocr_result_panel(res['meta']['ocr'], section_title="Image Reader")
 
-            if res.get('meta') and res['meta'].get('realtime_result'):
-                rt = res['meta']['realtime_result']
+            rt = res.get('meta', {}).get('realtime_result') if res.get('meta') else None
+
+            if (
+                res.get('source_type') == 'image'
+                and res.get('meta', {}).get('ocr')
+                and rt
+                and rt.get('status') != 'NO_RESULTS'
+                and rt.get('sources')
+            ):
+                st.markdown('<div class="glass-card" style="border-left: 4px solid #0ea5e9;">', unsafe_allow_html=True)
+                render_article_match_browser(
+                    rt,
+                    widget_namespace=f"fn_image_match_primary_{res.get('source_name') or 'image'}",
+                    section_title="Matching Articles From Extracted Image Text",
+                    intro_text="These are the live articles matched against the text extracted from your uploaded article image.",
+                )
+                with st.expander("Image Match Details"):
+                    render_live_news_comparison(rt, res.get('text', ''))
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            if rt:
                 st.markdown('<div class="glass-card" style="border-left: 4px solid #3b82f6;">', unsafe_allow_html=True)
                 impact = res['meta'].get('realtime_impact')
                 if impact:
@@ -2686,7 +2817,21 @@ elif st.session_state.page == "Fake News Detection":
                             st.error(f"🚨 **{verdict_code.replace('_', ' ')}**")
                     st.progress(consensus)
                     st.caption(rt['message'])
-                    render_live_news_comparison(rt, res.get('text', ''))
+                    if rt.get('sources'):
+                        intro_text = "Review the matched live articles used to support this fake-news decision."
+                        section_title = "Matching Articles"
+                        details_label = "Live News Comparison Details"
+                        if res.get('source_type') != 'image' or not res.get('meta', {}).get('ocr'):
+                            render_article_match_browser(
+                                rt,
+                                widget_namespace=f"fn_match_{res.get('source_name') or res.get('source_type') or 'text'}",
+                                section_title=section_title,
+                                intro_text=intro_text,
+                            )
+                            with st.expander(details_label):
+                                render_live_news_comparison(rt, res.get('text', ''))
+                        else:
+                            st.caption("Matching articles from the extracted image text are shown above.")
                 st.markdown('</div>', unsafe_allow_html=True)
 
             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
@@ -2706,35 +2851,17 @@ elif st.session_state.page == "Fake News Detection":
                 st.warning("⚠️ CRITICAL: Extreme sensationalism detected (High Clickbait score). Standard marker for misinformation.")
             st.markdown('</div>', unsafe_allow_html=True)
 
-            col1, col2 = st.columns([3, 2])
-            with col1:
-                st.markdown('<div class="glass-card" style="height:450px;">', unsafe_allow_html=True)
-                report_tabs = st.tabs(["📊 Verdict", "📦 Ensemble Logic"]) if res.get('meta', {}).get('ensemble_mode') else [st.container()]
-                
-                with report_tabs[0]:
-                    st.markdown("#### Detection Confidence")
-                    st.write("The model analyzes syntactic structure, punctuation density, and superlative usage to determine authenticity.")
-                    st.info(f"Primary classification threshold met with {res['conf']:.1%} confidence.")
-                    if res['label'] == 'FAKE':
-                        st.warning("⚠️ High frequency of sensationalist linguistic patterns detected.")
-                    else:
-                        st.success("✅ Content displays patterns consistent with professional journalism standards.")
-                
-                if len(report_tabs) > 1:
-                    with report_tabs[1]:
-                        st.markdown("#### Weighted Consensus Breakdown")
-                        scores = res['meta'].get('individual_scores', {})
-                        for name, s_res in scores.items():
-                            s_cls = "red" if s_res['label'] == 'FAKE' else "green"
-                            st.markdown(f"**{name}**: <span style='color:{s_cls};'>{s_res['label']} ({s_res['confidence']:.1%})</span>", unsafe_allow_html=True)
-                            st.progress(s_res['confidence'])
-                st.markdown('</div>', unsafe_allow_html=True)
-            with col2:
-                st.markdown('<div class="glass-card" style="height:450px;">', unsafe_allow_html=True)
-                fig = create_gauge(res['conf'], 0.5, title="Model Confidence")
-                _render_plotly_chart(fig)
-                st.markdown('</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+            scores = res.get('meta', {}).get('individual_scores', {})
+            if scores:
+                with st.expander("Model Diagnostics"):
+                    st.markdown("#### Weighted Consensus Breakdown")
+                    for name, s_res in scores.items():
+                        s_cls = "red" if s_res['label'] == 'FAKE' else "green"
+                        st.markdown(
+                            f"**{name}**: <span style='color:{s_cls};'>{s_res['label']} ({s_res['confidence']:.1%})</span>",
+                            unsafe_allow_html=True,
+                        )
+                        st.progress(s_res['confidence'])
     else:  # Bulk Processing
         file = st.file_uploader("Upload Article File", type=['txt', 'csv'])
         if file:
