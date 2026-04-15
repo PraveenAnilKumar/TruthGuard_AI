@@ -57,9 +57,13 @@ import plotly.graph_objects as go
 import plotly.express as px
 import json
 import hashlib
+import hmac
 import base64
 import io
 import gc
+import math
+import re
+import time
 from html import escape
 from pathlib import Path
 import glob
@@ -94,6 +98,19 @@ if not ADMIN_PASS:
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_VIDEO_UPLOAD_BYTES = 200 * 1024 * 1024
+MAX_TEXT_UPLOAD_BYTES = 2 * 1024 * 1024
+MAX_BULK_TEXT_ROWS = 250
+MAX_IMAGE_PIXELS = 25_000_000
+LOGIN_WINDOW_SECONDS = 300
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_COOLDOWN_SECONDS = 60
+VALID_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+USER_DB_LOCK = threading.RLock()
+
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 # ============================================================================
 # PAGE CONFIG (MUST BE FIRST)
@@ -212,6 +229,153 @@ def _load_detectors():
 USER_DB = "users.json"
 
 
+def _normalize_username(username):
+    return re.sub(r"\s+", " ", str(username or "")).strip()
+
+
+def _resolve_user_record(users, username):
+    normalized = _normalize_username(username).casefold()
+    if not normalized:
+        return None, None
+    for stored_name, payload in users.items():
+        if str(stored_name).casefold() == normalized:
+            return stored_name, payload
+    return None, None
+
+
+def _password_meets_policy(password):
+    password = str(password or "")
+    return (
+        len(password) >= 8
+        and any(ch.isalpha() for ch in password)
+        and any(ch.isdigit() for ch in password)
+    )
+
+
+def _prune_login_attempts(now=None):
+    now = time.time() if now is None else float(now)
+    attempts = [
+        float(ts)
+        for ts in st.session_state.get("login_attempt_timestamps", [])
+        if isinstance(ts, (int, float)) and now - float(ts) < LOGIN_WINDOW_SECONDS
+    ]
+    st.session_state.login_attempt_timestamps = attempts
+    blocked_until = float(st.session_state.get("login_blocked_until", 0.0) or 0.0)
+    if blocked_until and blocked_until <= now:
+        st.session_state.login_blocked_until = 0.0
+    return attempts
+
+
+def _remaining_login_cooldown_seconds():
+    now = time.time()
+    _prune_login_attempts(now)
+    blocked_until = float(st.session_state.get("login_blocked_until", 0.0) or 0.0)
+    if blocked_until <= now:
+        return 0
+    return int(math.ceil(blocked_until - now))
+
+
+def _record_failed_login_attempt():
+    now = time.time()
+    attempts = _prune_login_attempts(now)
+    attempts.append(now)
+    st.session_state.login_attempt_timestamps = attempts
+    if len(attempts) >= MAX_LOGIN_ATTEMPTS:
+        st.session_state.login_blocked_until = now + LOGIN_COOLDOWN_SECONDS
+
+
+def _reset_login_rate_limit():
+    st.session_state.login_attempt_timestamps = []
+    st.session_state.login_blocked_until = 0.0
+
+
+def _format_file_size(size_bytes):
+    size = float(max(size_bytes or 0, 0))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024
+    return f"{int(size_bytes)} B"
+
+
+def _uploaded_file_size(uploaded_file):
+    size = getattr(uploaded_file, "size", None)
+    if isinstance(size, int) and size >= 0:
+        return size
+    try:
+        current = uploaded_file.tell()
+        uploaded_file.seek(0, 2)
+        size = uploaded_file.tell()
+        uploaded_file.seek(current)
+        return max(size, 0)
+    except Exception:
+        try:
+            return len(uploaded_file.getbuffer())
+        except Exception:
+            return 0
+
+
+def _require_upload_within_limit(uploaded_file, max_bytes, label):
+    size = _uploaded_file_size(uploaded_file)
+    if size and size > max_bytes:
+        raise ValueError(
+            f"{label} is too large ({_format_file_size(size)}). "
+            f"Keep it under {_format_file_size(max_bytes)} for reliable analysis."
+        )
+
+
+def _load_uploaded_image(uploaded_file, *, max_size=(800, 800), label="Image upload"):
+    _require_upload_within_limit(uploaded_file, MAX_IMAGE_UPLOAD_BYTES, label)
+    uploaded_file.seek(0)
+    with Image.open(uploaded_file) as probe:
+        if probe.width * probe.height > MAX_IMAGE_PIXELS:
+            raise ValueError(
+                f"{label} is too large to process safely ({probe.width}x{probe.height} pixels). "
+                f"Please upload a smaller image."
+            )
+        probe.verify()
+    uploaded_file.seek(0)
+    with Image.open(uploaded_file) as opened:
+        opened.load()
+        working = ImageOps.exif_transpose(opened).copy()
+    uploaded_file.seek(0)
+    return optimize_image(working, max_size=max_size)
+
+
+def _read_uploaded_csv(uploaded_file, *, label="CSV upload", nrows=None):
+    _require_upload_within_limit(uploaded_file, MAX_TEXT_UPLOAD_BYTES, label)
+    uploaded_file.seek(0)
+    dataframe = pd.read_csv(uploaded_file, nrows=nrows)
+    uploaded_file.seek(0)
+    return dataframe
+
+
+def _read_uploaded_text_lines(uploaded_file, *, label="Text upload", max_lines=MAX_BULK_TEXT_ROWS):
+    _require_upload_within_limit(uploaded_file, MAX_TEXT_UPLOAD_BYTES, label)
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+    if isinstance(raw, bytes):
+        decoded = raw.decode("utf-8", errors="replace")
+    else:
+        decoded = str(raw)
+    lines = [line.strip() for line in decoded.splitlines() if line.strip()]
+    return lines[:max_lines], len(lines) > max_lines
+
+
+def _write_uploaded_video_tempfile(uploaded_file):
+    _require_upload_within_limit(uploaded_file, MAX_VIDEO_UPLOAD_BYTES, "Video upload")
+    suffix = Path(getattr(uploaded_file, "name", "") or "upload.mp4").suffix or ".mp4"
+    uploaded_file.seek(0)
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        handle.write(uploaded_file.read())
+        return handle.name
+    finally:
+        handle.close()
+        uploaded_file.seek(0)
+
+
 def get_password_hash(password):
     """Secure password hashing using bcrypt."""
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -233,8 +397,10 @@ def load_users():
     """Load and cache the user database from disk."""
     if Path(USER_DB).exists():
         try:
-            with open(USER_DB, 'r') as f:
-                return json.load(f)
+            with USER_DB_LOCK:
+                with open(USER_DB, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            return payload if isinstance(payload, dict) else {}
         except Exception as e:
             logger.error(f"Error loading user database: {e}")
     return {}
@@ -242,26 +408,41 @@ def load_users():
 
 def save_users(users):
     """Persist the user database and invalidate the read cache immediately."""
+    temp_path = None
     try:
-        with open(USER_DB, 'w') as f:
-            json.dump(users, f, indent=2)
+        db_path = Path(USER_DB)
+        temp_path = db_path.with_suffix(db_path.suffix + ".tmp")
+        with USER_DB_LOCK:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(users, f, indent=2, ensure_ascii=False)
+            os.replace(temp_path, db_path)
         load_users.clear()
     except Exception as e:
         logger.error(f"Error saving user database: {e}")
+        if temp_path is not None:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
 
 
 def register_user(username, password, role="user"):
     """Create a new local user account."""
-    username = username.strip()
+    username = _normalize_username(username)
+    role = str(role or "user").strip().lower()
     if not username:
         return False, "Username is required."
-    if len(username) < 3:
-        return False, "Username must be at least 3 characters long."
-    if len(password) < 6:
-        return False, "Password must be at least 6 characters long."
+    if not VALID_USERNAME_RE.fullmatch(username):
+        return False, "Username must be 3-32 characters and use only letters, numbers, '.', '_' or '-'."
+    if not _password_meets_policy(password):
+        return False, "Password must be at least 8 characters and include both letters and numbers."
+    if role not in {"user", "admin"}:
+        return False, "Invalid role requested."
 
     users = load_users()
-    if username == ADMIN_USER or username in users:
+    existing_name, _ = _resolve_user_record(users, username)
+    if username.casefold() == ADMIN_USER.casefold() or existing_name is not None:
         return False, "That username already exists."
 
     users[username] = {
@@ -629,6 +810,8 @@ default_state = {
     'last_toxicity': None,
     'toxicity_train_data': None,
     'fn_verification_result': None,
+    'login_attempt_timestamps': [],
+    'login_blocked_until': 0.0,
     'page_num': 0,
 }
 
@@ -785,9 +968,10 @@ def release_all_feature_resources():
 
 def optimize_image(image, max_size=(800, 800)):
     """Resize large images before processing."""
-    if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
-        image.thumbnail(max_size, Image.Resampling.LANCZOS)
-    return image
+    working = image.copy()
+    if working.size[0] > max_size[0] or working.size[1] > max_size[1]:
+        working.thumbnail(max_size, Image.Resampling.LANCZOS)
+    return working
 
 
 def create_gauge(value, threshold=0.5, title="Confidence", height=250):
@@ -1053,10 +1237,12 @@ def render_sentiment_result_panel(result):
             for i, (aspect, data) in enumerate(results.items()):
                 with cols[i % 3]:
                     color = "#10b981" if data['label'] == 'POSITIVE' else "#ef4444" if data['label'] == 'NEGATIVE' else "#94a3b8"
+                    safe_aspect = escape(str(aspect).title())
+                    safe_label = escape(str(data['label']))
                     st.markdown(f'''
                     <div class="glass-card" style="padding:1.2rem; border-top: 4px solid {color};">
-                        <h5 style="margin:0; text-transform:uppercase; letter-spacing:0.05em;">{aspect}</h5>
-                        <p style="color:{color}; font-weight:700; font-size:1.2rem; margin:0.5rem 0;">{data['label']}</p>
+                        <h5 style="margin:0; text-transform:uppercase; letter-spacing:0.05em;">{safe_aspect}</h5>
+                        <p style="color:{color}; font-weight:700; font-size:1.2rem; margin:0.5rem 0;">{safe_label}</p>
                         <p style="font-size:0.8rem; color:#94a3b8;">Confidence: {data['confidence']:.1%}</p>
                     </div>
                     ''', unsafe_allow_html=True)
@@ -1217,6 +1403,7 @@ def _theme_for_page(page_name: str, authenticated: bool) -> Dict[str, str]:
     return THEME_PRESETS.get(page_name, THEME_PRESETS["Home"])
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def _file_to_data_uri(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".svg":
@@ -1862,22 +2049,43 @@ if not st.session_state.authenticated:
             password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Login", width="stretch")
             if submitted:
-                users = load_users()
-                if username == ADMIN_USER and password == ADMIN_PASS and ADMIN_PASS:
-                    st.session_state.authenticated = True
-                    st.session_state.username = ADMIN_USER
-                    st.session_state.role = "admin"
-                    st.rerun()
-                elif username in users and verify_password(password, users[username]["password"]):
-                    if len(users[username]["password"]) == 64:
-                        users[username]["password"] = get_password_hash(password)
-                        save_users(users)
-                    st.session_state.authenticated = True
-                    st.session_state.username = username
-                    st.session_state.role = users[username].get("role", "user")
-                    st.rerun()
+                cooldown_remaining = _remaining_login_cooldown_seconds()
+                if cooldown_remaining > 0:
+                    st.error(
+                        f"Too many login attempts. Please wait about {cooldown_remaining} seconds and try again."
+                    )
                 else:
-                    st.error("Invalid credentials.")
+                    users = load_users()
+                    stored_username, stored_user = _resolve_user_record(users, username)
+                    normalized_username = _normalize_username(username)
+                    if (
+                        normalized_username.casefold() == ADMIN_USER.casefold()
+                        and ADMIN_PASS
+                        and hmac.compare_digest(password, ADMIN_PASS)
+                    ):
+                        _reset_login_rate_limit()
+                        st.session_state.authenticated = True
+                        st.session_state.username = ADMIN_USER
+                        st.session_state.role = "admin"
+                        st.rerun()
+                    elif stored_username and stored_user and verify_password(password, stored_user.get("password", "")):
+                        if len(stored_user.get("password", "")) == 64:
+                            users[stored_username]["password"] = get_password_hash(password)
+                            save_users(users)
+                        _reset_login_rate_limit()
+                        st.session_state.authenticated = True
+                        st.session_state.username = stored_username
+                        st.session_state.role = "admin" if stored_user.get("role") == "admin" else "user"
+                        st.rerun()
+                    else:
+                        _record_failed_login_attempt()
+                        retry_hint = _remaining_login_cooldown_seconds()
+                        if retry_hint > 0:
+                            st.error(
+                                f"Invalid credentials. Login is temporarily paused for {retry_hint} seconds."
+                            )
+                        else:
+                            st.error("Invalid credentials.")
 
     with register_tab:
         with st.form("register_form"):
@@ -1891,7 +2099,9 @@ if not st.session_state.authenticated:
             if registered:
                 if new_password != confirm_password:
                     st.error("Passwords do not match.")
-                elif create_admin and admin_key != ADMIN_REG_KEY:
+                elif create_admin and not ADMIN_REG_KEY:
+                    st.error("Admin account creation is disabled until ADMIN_REGISTRATION_KEY is configured.")
+                elif create_admin and not hmac.compare_digest(admin_key or "", ADMIN_REG_KEY):
                     st.error("Invalid admin registration key.")
                 else:
                     role = "admin" if create_admin else "user"
@@ -1933,10 +2143,12 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    safe_username = escape(str(st.session_state.username or "Unknown"))
+    safe_role = escape(str((st.session_state.role or "user")).upper())
     st.markdown(f"""
     <div style="background:rgba(30,41,59,0.8); padding:1rem; border-radius:12px; margin-bottom:1rem;">
-        <h4 style="margin:0;">👤 {st.session_state.username}</h4>
-        <p style="margin:0; color:#94a3b8;">Role: {st.session_state.role.upper()}</p>
+        <h4 style="margin:0;">👤 {safe_username}</h4>
+        <p style="margin:0; color:#94a3b8;">Role: {safe_role}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2172,11 +2384,15 @@ elif st.session_state.page == "Deepfake Detection":
             key="df_image_upload",
         )
         if img_file:
-            img = Image.open(img_file)
-            img = optimize_image(img)
-            st.image(img, caption="Target Image", width="stretch")
+            try:
+                img = _load_uploaded_image(img_file, max_size=(800, 800), label="Deepfake image upload")
+            except Exception as e:
+                img = None
+                st.error(f"Could not process the uploaded image: {e}")
+            if img is not None:
+                st.image(img, caption="Target Image", width="stretch")
 
-            if st.button("🚀 Run Image Deepfake Analysis", width="stretch", key="btn_run_df_image"):
+            if img is not None and st.button("🚀 Run Image Deepfake Analysis", width="stretch", key="btn_run_df_image"):
                 with st.spinner("Analyzing frames and pixel consistency..."):
                     try:
                         _clear_feature_session_state("Deepfake Detection")
@@ -2237,15 +2453,20 @@ elif st.session_state.page == "Deepfake Detection":
     else:
         vid_file = st.file_uploader("Upload Video for Scrutiny", type=['mp4', 'avi', 'mov'], key="df_video_upload")
         if vid_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as f:
-                f.write(vid_file.read())
-                path = f.name
+            try:
+                _require_upload_within_limit(vid_file, MAX_VIDEO_UPLOAD_BYTES, "Deepfake video upload")
+            except Exception as e:
+                st.error(str(e))
+                vid_file = None
 
-            st.video(path)
+        if vid_file:
+            st.video(vid_file)
 
             if st.button("🚀 Run Video Deepfake Analysis", width="stretch", key="btn_run_df_video"):
+                path = None
                 try:
                     with st.spinner("Performing temporal and spatial analysis..."):
+                        path = _write_uploaded_video_tempfile(vid_file)
                         _clear_feature_session_state("Deepfake Detection")
                         st.session_state.df_preview_image = None
                         if selected_model == DEEPFAKE_ENSEMBLE_LABEL or model_selection_mode == "Full Ensemble":
@@ -2285,10 +2506,7 @@ elif st.session_state.page == "Deepfake Detection":
                         st.session_state.df_result = _compact_deepfake_result(res)
                     st.rerun()
                 finally:
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+                    _safe_delete_artifact(path)
     st.markdown('</div>', unsafe_allow_html=True)
 
     if st.session_state.df_result:
@@ -2657,9 +2875,11 @@ elif st.session_state.page == "Fake News Detection":
 
             if uploaded_article_image is not None:
                 try:
-                    opened_image = Image.open(uploaded_article_image)
-                    opened_image = ImageOps.exif_transpose(opened_image)
-                    article_image = optimize_image(opened_image.copy(), max_size=(1400, 1400))
+                    article_image = _load_uploaded_image(
+                        uploaded_article_image,
+                        max_size=(1400, 1400),
+                        label="Article image upload",
+                    )
                     st.image(article_image, caption="Article image", width="stretch")
                 except Exception as e:
                     article_image = None
@@ -2857,8 +3077,10 @@ elif st.session_state.page == "Fake News Detection":
                     st.markdown("#### Weighted Consensus Breakdown")
                     for name, s_res in scores.items():
                         s_cls = "red" if s_res['label'] == 'FAKE' else "green"
+                        safe_name = escape(str(name))
+                        safe_label = escape(str(s_res['label']))
                         st.markdown(
-                            f"**{name}**: <span style='color:{s_cls};'>{s_res['label']} ({s_res['confidence']:.1%})</span>",
+                            f"**{safe_name}**: <span style='color:{s_cls};'>{safe_label} ({s_res['confidence']:.1%})</span>",
                             unsafe_allow_html=True,
                         )
                         st.progress(s_res['confidence'])
@@ -2867,32 +3089,43 @@ elif st.session_state.page == "Fake News Detection":
         if file:
             if st.button("🚀 Analyze Bulk Content", width="stretch"):
                 with st.spinner("Processing file..."):
-                    if file.name.endswith('.csv'):
-                        df = pd.read_csv(file)
-                        text_col = st.selectbox("Select text column", df.columns) if 'text' not in df.columns else 'text'
-                        texts = df[text_col].astype(str).tolist()
+                    try:
+                        truncated = False
+                        if file.name.endswith('.csv'):
+                            df = _read_uploaded_csv(file, label="Bulk article CSV", nrows=MAX_BULK_TEXT_ROWS)
+                            text_col = st.selectbox("Select text column", df.columns) if 'text' not in df.columns else 'text'
+                            texts = df[text_col].astype(str).tolist()
+                            truncated = len(df) >= MAX_BULK_TEXT_ROWS
+                        else:
+                            texts, truncated = _read_uploaded_text_lines(
+                                file,
+                                label="Bulk article text file",
+                                max_lines=MAX_BULK_TEXT_ROWS,
+                            )
+
+                        max_texts = min(MAX_BULK_TEXT_ROWS, len(texts))
+                        results = []
+                        progress = st.progress(0)
+
+                        for i, t in enumerate(texts[:max_texts]):
+                            try:
+                                label, conf, click, meta = fake_news_detector.predict(t)
+                                results.append({
+                                    'text': t[:100] + '...',
+                                    'label': label,
+                                    'confidence': f"{conf:.2%}",
+                                    'language': meta.get('original_language', 'en'),
+                                    'clickbait': f"{click:.2f}",
+                                })
+                            except Exception:
+                                results.append({'text': t[:100] + '...', 'label': 'ERROR', 'confidence': 'N/A'})
+                            progress.progress((i + 1) / max_texts)
+                    except Exception as e:
+                        st.error(f"Bulk processing failed: {e}")
                     else:
-                        texts = [line.strip() for line in file.read().decode().split('\n') if line.strip()]
-
-                    max_texts = min(100, len(texts))
-                    results = []
-                    progress = st.progress(0)
-
-                    for i, t in enumerate(texts[:max_texts]):
-                        try:
-                            label, conf, click, meta = fake_news_detector.predict(t)
-                            results.append({
-                                'text': t[:100] + '...',
-                                'label': label,
-                                'confidence': f"{conf:.2%}",
-                                'language': meta.get('original_language', 'en'),
-                                'clickbait': f"{click:.2f}",
-                            })
-                        except Exception:
-                            results.append({'text': t[:100] + '...', 'label': 'ERROR', 'confidence': 'N/A'})
-                        progress.progress((i + 1) / max_texts)
-
-                    st.dataframe(pd.DataFrame(results), width="stretch")
+                        if truncated:
+                            st.info(f"Processed the first {max_texts} rows to keep bulk analysis responsive.")
+                        st.dataframe(pd.DataFrame(results), width="stretch")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ============================================================================
@@ -2961,9 +3194,11 @@ elif st.session_state.page == COMMUNICATION_PAGE:
 
             if uploaded_message_image is not None:
                 try:
-                    opened_image = Image.open(uploaded_message_image)
-                    opened_image = ImageOps.exif_transpose(opened_image)
-                    communication_image = optimize_image(opened_image.copy(), max_size=(1400, 1400))
+                    communication_image = _load_uploaded_image(
+                        uploaded_message_image,
+                        max_size=(1400, 1400),
+                        label="Communication image upload",
+                    )
                     st.image(communication_image, caption="Uploaded text image", width="stretch")
                 except Exception as e:
                     communication_image = None
@@ -3117,7 +3352,11 @@ elif st.session_state.page == COMMUNICATION_PAGE:
         selected_text_col = None
         if uploaded_file and uploaded_file.name.endswith('.csv'):
             try:
-                preview_df = pd.read_csv(uploaded_file)
+                preview_df = _read_uploaded_csv(
+                    uploaded_file,
+                    label="Batch communication CSV",
+                    nrows=MAX_BULK_TEXT_ROWS,
+                )
             except Exception as e:
                 st.error(f"Could not read the uploaded CSV: {e}")
             else:
@@ -3135,12 +3374,24 @@ elif st.session_state.page == COMMUNICATION_PAGE:
 
                     processor = BatchSentimentProcessor()
                     if uploaded_file.name.endswith('.csv'):
-                        df = pd.read_csv(uploaded_file)
+                        df = _read_uploaded_csv(
+                            uploaded_file,
+                            label="Batch communication CSV",
+                            nrows=MAX_BULK_TEXT_ROWS,
+                        )
                         text_col = selected_text_col or ('text' if 'text' in df.columns else df.columns[0])
                         results_df = processor.process_texts(df[text_col].astype(str).tolist())
+                        if len(df) >= MAX_BULK_TEXT_ROWS:
+                            st.info(f"Processed the first {len(df)} rows to keep batch analysis responsive.")
                     else:
-                        texts = [line.strip() for line in uploaded_file.read().decode().split('\n') if line.strip()]
+                        texts, truncated = _read_uploaded_text_lines(
+                            uploaded_file,
+                            label="Batch communication text file",
+                            max_lines=MAX_BULK_TEXT_ROWS,
+                        )
                         results_df = processor.process_texts(texts)
+                        if truncated:
+                            st.info(f"Processed the first {len(texts)} rows to keep batch analysis responsive.")
                 except Exception as e:
                     logger.exception("Batch sentiment analysis failed")
                     st.error(f"Batch processing failed: {e}")

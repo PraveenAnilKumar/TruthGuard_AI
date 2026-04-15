@@ -10,6 +10,7 @@ don't block startup. The real __init__ only fires on first use after login.
 import logging
 import os
 import re
+import ipaddress
 from collections import Counter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -50,9 +51,12 @@ class RealtimeNewsVerifier:
             "User-Agent": "TruthGuardAI/1.0 (+https://truthguard.local)",
             "Accept-Language": "en-US,en;q=0.9",
         })
+        self.session.max_redirects = 4
         self.max_results_per_query = 8
         self.max_sources_returned = 10
         self.max_article_fetches = 5
+        self.max_cached_articles = 64
+        self.max_article_chars = 12000
         self.article_cache: Dict[str, str] = {}
         self.reputable_sources = {
             'reuters.com': 1.0,
@@ -110,6 +114,47 @@ class RealtimeNewsVerifier:
         parsed = urlparse(url)
         clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         return clean.rstrip("/")
+
+    def _is_safe_public_url(self, url: str) -> bool:
+        try:
+            parsed = urlparse((url or "").strip())
+        except Exception:
+            return False
+
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        if parsed.port not in (None, 80, 443):
+            return False
+
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not host or host == "localhost":
+            return False
+        if host.endswith((".local", ".internal", ".localhost", ".home", ".lan")):
+            return False
+
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return True
+
+        return not (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        )
+
+    def _remember_article_text(self, url: str, text: str) -> str:
+        normalized = text[:self.max_article_chars]
+        self.article_cache[url] = normalized
+        while len(self.article_cache) > self.max_cached_articles:
+            oldest_key = next(iter(self.article_cache))
+            self.article_cache.pop(oldest_key, None)
+        return normalized
 
     def _parse_datetime(self, value: str) -> Optional[datetime]:
         if not value:
@@ -265,7 +310,7 @@ class RealtimeNewsVerifier:
                         'source': (a.get('source') or {}).get('name', ''),
                     }
                     for a in data.get('articles', [])
-                    if a.get('title') and a.get('url')
+                    if a.get('title') and a.get('url') and self._is_safe_public_url(a.get('url', ''))
                 ]
         except Exception as exc:
             logger.error(f"NewsAPI error: {exc}")
@@ -289,9 +334,12 @@ class RealtimeNewsVerifier:
             soup = BeautifulSoup(response.content, 'xml')
             items = []
             for item in soup.find_all('item')[:self.max_results_per_query]:
+                item_url = item.link.text if item.link else ""
+                if not self._is_safe_public_url(item_url):
+                    continue
                 items.append({
                     'title': self._normalize_whitespace(item.title.text if item.title else ""),
-                    'url': item.link.text if item.link else "",
+                    'url': item_url,
                     'pub_date': item.pubDate.text if item.pubDate else "",
                     'source': item.source.text if item.source else "Reported Source",
                 })
@@ -302,6 +350,9 @@ class RealtimeNewsVerifier:
 
     def _fetch_article_text(self, url: str) -> str:
         if not url:
+            return ""
+        if not self._is_safe_public_url(url):
+            logger.warning("Skipping non-public article URL: %s", url)
             return ""
         if url in self.article_cache:
             return self.article_cache[url]
@@ -326,8 +377,7 @@ class RealtimeNewsVerifier:
             except Exception as exc:
                 logger.debug(f"HTML extraction failed for {url}: {exc}")
 
-        self.article_cache[url] = text[:12000]
-        return self.article_cache[url]
+        return self._remember_article_text(url, text)
 
     def _extract_best_matching_snippet(self, claim_text: str, article_text: str) -> str:
         if not article_text:

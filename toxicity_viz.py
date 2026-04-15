@@ -239,28 +239,42 @@ class ToxicityVisualizer:
         Render text with HTML highlights for toxic words
         """
         import re
+        from html import escape
+
+        text = str(text or "")
         word_impact = explanation.get('word_impact', {})
         if not word_impact:
-            return f'<div style="font-size: 1.2rem; line-height: 1.6; color: #f8fafc;">{text}</div>'
+            return f'<div style="font-size: 1.2rem; line-height: 1.6; color: #f8fafc;">{escape(text)}</div>'
         
         # Sort words by length descending to avoid substring replacement issues
-        sorted_words = sorted(word_impact.keys(), key=len, reverse=True)
-        
-        highlighted_text = text
-        for word in sorted_words:
-            # Case insensitive replacement
-            score = word_impact[word]['score']
-            color = "#ef4444" if score > 0.6 else "#f59e0b" if score > 0.3 else "#10b981"
-            bg_opacity = 0.3 if score > 0.6 else 0.2
-            
-            # Use regex for word boundaries
-            pattern = re.compile(r"\b(" + re.escape(word) + r")\b", re.IGNORECASE)
-            
-            def replace_fn(match):
+        sorted_words = [word for word in sorted(word_impact.keys(), key=len, reverse=True) if word]
+        score_by_word = {
+            str(word).lower(): float((meta or {}).get('score', 0.0))
+            for word, meta in word_impact.items()
+        }
+
+        highlighted_parts = []
+        last_index = 0
+        if sorted_words:
+            pattern = re.compile(
+                r"\b(" + "|".join(re.escape(word) for word in sorted_words) + r")\b",
+                re.IGNORECASE,
+            )
+            for match in pattern.finditer(text):
+                highlighted_parts.append(escape(text[last_index:match.start()]))
                 original_word = match.group(0)
-                return f'<span style="background-color: {color}{int(bg_opacity*255):02x}; border-bottom: 2px solid {color}; padding: 2px 4px; border-radius: 4px; font-weight: 600; cursor: help;" title="Importance: {score:.1%}">{original_word}</span>'
-            
-            highlighted_text = pattern.sub(replace_fn, highlighted_text)
+                score = score_by_word.get(original_word.lower(), 0.0)
+                color = "#ef4444" if score > 0.6 else "#f59e0b" if score > 0.3 else "#10b981"
+                bg_opacity = 0.3 if score > 0.6 else 0.2
+                highlighted_parts.append(
+                    f'<span style="background-color: {color}{int(bg_opacity*255):02x}; '
+                    f'border-bottom: 2px solid {color}; padding: 2px 4px; border-radius: 4px; '
+                    f'font-weight: 600; cursor: help;" title="Importance: {score:.1%}">'
+                    f'{escape(original_word)}</span>'
+                )
+                last_index = match.end()
+        highlighted_parts.append(escape(text[last_index:]))
+        highlighted_text = "".join(highlighted_parts)
 
         return f'<div style="font-size: 1.2rem; line-height: 1.6; color: #f8fafc; background: rgba(30,41,59,0.5); padding: 1.5rem; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1);">{highlighted_text}</div>'
 
