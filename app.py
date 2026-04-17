@@ -1070,13 +1070,14 @@ def render_communication_summary(sentiment_result, toxicity_result):
 
     st.markdown('<div class="glass-card animate-fade">', unsafe_allow_html=True)
     st.markdown("### 🧠 Communication Snapshot")
-    st.caption("Tone and safety signals are summarized together for the latest single-message analysis.")
+    st.caption("Tone, emotion, aspect, and safety signals are summarized together for the latest single-message analysis.")
     col1, col2 = st.columns(2)
 
     with col1:
         if single_sentiment:
             label = single_sentiment.get("label", "NEUTRAL")
             meta = single_sentiment.get("meta") or {}
+            aspect_count = len(single_sentiment.get("aspects") or {})
             tone_copy = {
                 "POSITIVE": "Constructive or favorable tone",
                 "NEGATIVE": "Critical or unfavorable tone",
@@ -1084,7 +1085,8 @@ def render_communication_summary(sentiment_result, toxicity_result):
             }.get(label, "Mixed emotional signal")
             st.metric("Sentiment", label.title(), f"{single_sentiment.get('conf', 0.0):.1%} confidence")
             dominant_emotion = str(meta.get("dominant_emotion", "balanced")).replace("_", " ").title()
-            st.caption(f"{tone_copy} | Dominant emotion: {dominant_emotion}")
+            aspect_copy = f" | Aspect signals: {aspect_count}" if aspect_count else ""
+            st.caption(f"{tone_copy} | Dominant emotion: {dominant_emotion}{aspect_copy}")
         else:
             st.metric("Sentiment", "Unavailable")
             st.caption("Run a unified scan to generate an emotional-intent reading.")
@@ -1103,6 +1105,98 @@ def render_communication_summary(sentiment_result, toxicity_result):
             st.metric("Safety", "Unavailable")
             st.caption("Run a unified scan to generate a toxicity and harm review.")
 
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def _format_emotion_label(emotion):
+    return str(emotion or "balanced").replace("_", " ").title()
+
+
+def _get_aspect_results(result):
+    if not result:
+        return {}
+    if result.get("type") == "aspect":
+        return result.get("results") or {}
+    return result.get("aspects") or {}
+
+
+def render_sentiment_explanation(meta):
+    explanation = (meta or {}).get("explanation") or {}
+    if not explanation:
+        return
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown("### Why This Was Detected")
+
+    summary = explanation.get("summary")
+    if summary:
+        st.info(summary)
+
+    top_emotions = explanation.get("top_emotions") or meta.get("emotion_rankings") or []
+    if top_emotions:
+        st.markdown("#### Emotion Spectrum")
+        emotion_cols = st.columns(min(len(top_emotions), 3))
+        for i, item in enumerate(top_emotions[:3]):
+            with emotion_cols[i]:
+                st.metric(_format_emotion_label(item.get("emotion")), f"{item.get('score', 0)} signal(s)")
+                terms = item.get("terms") or []
+                if terms:
+                    st.caption("Signals: " + ", ".join(terms))
+
+    signal_evidence = explanation.get("signal_evidence") or []
+    if signal_evidence:
+        st.markdown("#### Decision Evidence")
+        for reason in signal_evidence:
+            st.write(f"- {reason}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_aspect_breakdown(results, section_title="### Aspect-Based Breakdown"):
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown(section_title)
+    if not results:
+        st.info("No specific aspects detected. Try using keywords like 'service', 'price', 'quality', or 'design'.")
+    else:
+        cols = st.columns(min(len(results), 3))
+        for i, (aspect, data) in enumerate(results.items()):
+            with cols[i % 3]:
+                label = str(data.get('label', 'NEUTRAL'))
+                color = "#10b981" if label == 'POSITIVE' else "#ef4444" if label == 'NEGATIVE' else "#94a3b8"
+                safe_aspect = escape(str(aspect).title())
+                safe_label = escape(label)
+                safe_emotion = escape(_format_emotion_label(data.get("dominant_emotion", "balanced")))
+                safe_summary = escape(str((data.get("explanation") or {}).get("summary", "Aspect-level sentiment overview.")))
+                st.markdown(f'''
+                <div class="glass-card" style="padding:1.2rem; border-top: 4px solid {color};">
+                    <h5 style="margin:0; text-transform:uppercase; letter-spacing:0.05em;">{safe_aspect}</h5>
+                    <p style="color:{color}; font-weight:700; font-size:1.2rem; margin:0.5rem 0;">{safe_label}</p>
+                    <p style="font-size:0.8rem; color:#94a3b8; margin:0.2rem 0;">Confidence: {data.get('confidence', 0.0):.1%}</p>
+                    <p style="font-size:0.8rem; color:#cbd5f5; margin:0.2rem 0;">Emotion: {safe_emotion}</p>
+                    <p style="font-size:0.82rem; color:#cbd5f5; margin:0.6rem 0 0;">{safe_summary}</p>
+                </div>
+                ''', unsafe_allow_html=True)
+
+        st.markdown("#### Relevant Context Segments")
+        for aspect, data in results.items():
+            with st.expander(f"Context for {aspect.title()}"):
+                summary = (data.get("explanation") or {}).get("summary")
+                if summary:
+                    st.caption(summary)
+                for evidence in (data.get("explanation") or {}).get("evidence", []):
+                    st.write(f"- {evidence}")
+                sentences = data.get("sentences") or []
+                if not sentences:
+                    st.caption("No aspect-specific snippets were extracted; this aspect was inferred from the full message.")
+                for item in sentences:
+                    sentence = item.get("sentence", "")
+                    label = item.get("label", "NEUTRAL")
+                    emotion = _format_emotion_label(item.get("emotion", "balanced"))
+                    confidence = float(item.get("confidence", 0.0))
+                    st.write(f"- [{label} | {emotion} | {confidence:.1%}] {sentence}")
+                    explanation = item.get("explanation")
+                    if explanation:
+                        st.caption(explanation)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -1168,10 +1262,10 @@ def render_sentiment_result_panel(result):
         if result.get('meta') and result['meta'].get('was_translated'):
             st.warning(f"🌐 Audio/Text Translation: Analyzing tone from original **{result['meta']['original_language'].upper()}** content (Translated for model processing).")
 
+        meta = result.get("meta") or {}
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### Primary Sentiment")
-            meta = result.get("meta") or {}
             metrics = st.columns(2)
             with metrics[0]:
                 st.metric("Model Confidence", f"{result['conf']:.1%}")
@@ -1179,20 +1273,36 @@ def render_sentiment_result_panel(result):
                 st.metric("Sentiment Score", f"{meta.get('sentiment_score', 0.0):+.2f}")
             metrics_2 = st.columns(2)
             with metrics_2[0]:
-                st.metric(
-                    "Dominant Emotion",
-                    str(meta.get("dominant_emotion", "balanced")).replace("_", " ").title(),
-                )
+                st.metric("Dominant Emotion", _format_emotion_label(meta.get("dominant_emotion", "balanced")))
             with metrics_2[1]:
                 st.metric("Model Agreement", f"{meta.get('agreement', 0.0):.1%}")
             st.progress(result['conf'])
             tone_flags = meta.get("tone_flags") or []
             if tone_flags:
                 st.caption("Tone markers: " + ", ".join(flag.replace("_", " ") for flag in tone_flags))
-            st.info("Analysis based on linguistic sentiment markers and tonal classification.")
+            st.info("Analysis based on ensemble sentiment scoring, emotion cues, and aspect-aware evidence extraction.")
         with col2:
             fig = create_gauge(result['conf'], height=300)
             _render_plotly_chart(fig)
+
+        emotion_rankings = meta.get("emotion_rankings") or []
+        if emotion_rankings:
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            st.markdown("### Emotion Signals")
+            emotion_cols = st.columns(min(len(emotion_rankings), 3))
+            for i, item in enumerate(emotion_rankings[:3]):
+                with emotion_cols[i]:
+                    st.metric(_format_emotion_label(item.get("emotion")), f"{item.get('score', 0)} signal(s)")
+                    terms = item.get("terms") or []
+                    if terms:
+                        st.caption("Terms: " + ", ".join(terms))
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        render_sentiment_explanation(meta)
+
+        aspect_results = _get_aspect_results(result)
+        if aspect_results:
+            render_aspect_breakdown(aspect_results, section_title="### Aspect & Topic Breakdown")
 
     elif result['type'] == 'batch':
         df = _load_dataframe_artifact(result)
@@ -1227,6 +1337,8 @@ def render_sentiment_result_panel(result):
         st.markdown('</div>', unsafe_allow_html=True)
 
     elif result['type'] == 'aspect':
+        render_aspect_breakdown(result.get('results') or {})
+        return
         results = result['results']
         st.markdown('<div class="glass-card">', unsafe_allow_html=True)
         st.markdown("### 🔍 Aspect-Based Breakdown")
@@ -3136,6 +3248,9 @@ elif st.session_state.page == COMMUNICATION_PAGE:
     sentiment_analyzer, SENTIMENT_AVAILABLE = load_component(get_sentiment_analyzer, "Sentiment analyzer")
     toxicity_detector, TOXICITY_AVAILABLE = load_component(get_toxicity_detector, "Toxicity detector")
     ToxicityVisualizer, _ = load_component(get_toxicity_visualizer, "Toxicity visualizer")
+    AspectSentimentAnalyzer, ASPECT_AVAILABLE = load_component(
+        get_aspect_sentiment_analyzer, "Aspect sentiment analyzer"
+    )
 
     col1, col2 = st.columns([1, 8])
     with col1:
@@ -3148,10 +3263,16 @@ elif st.session_state.page == COMMUNICATION_PAGE:
 
     st.markdown('<div class="glass-card animate-fade">', unsafe_allow_html=True)
 
+    communication_modes = ["🧠 Unified Scan", "📊 Batch Processing"]
+    default_communication_mode = st.session_state.get("communication_mode", "🧠 Unified Scan")
+    if default_communication_mode not in communication_modes:
+        default_communication_mode = communication_modes[0]
+        st.session_state.communication_mode = default_communication_mode
+
     communication_mode = _segmented_control(
         "Workspace",
-        ["🧠 Unified Scan", "📊 Batch Processing", "🔍 Aspect Insights"],
-        default=st.session_state.get("communication_mode", "🧠 Unified Scan"),
+        communication_modes,
+        default=default_communication_mode,
         key="communication_mode",
     )
 
@@ -3207,11 +3328,13 @@ elif st.session_state.page == COMMUNICATION_PAGE:
         col1, col2 = st.columns([2, 1])
         with col1:
             if content_source == "Image to Text":
-                st.info("Read text from the image first, then run sentiment and toxicity analysis on the extracted message.")
+                st.info("Read text from the image first, then run sentiment, emotion, aspect, and toxicity analysis on the extracted message.")
             else:
-                st.info("Run emotional-intent analysis and harmful-content screening from the same message in one pass.")
+                st.info("Run emotional-intent analysis, aspect extraction, and harmful-content screening from the same message in one pass.")
             if not SENTIMENT_AVAILABLE or sentiment_analyzer is None:
                 st.warning("Sentiment analyzer is currently unavailable.")
+            if not ASPECT_AVAILABLE or AspectSentimentAnalyzer is None:
+                st.caption("Aspect extraction is temporarily unavailable, so the unified scan will return sentiment and safety only.")
             if not TOXICITY_AVAILABLE or toxicity_detector is None:
                 st.warning("Toxicity detector is currently unavailable.")
         with col2:
@@ -3259,9 +3382,9 @@ elif st.session_state.page == COMMUNICATION_PAGE:
                     st.error("Toxicity detector module not available.")
                 else:
                     spinner_label = (
-                        "Reading text from image and analyzing tone and safety markers..."
+                        "Reading text from image and analyzing tone, aspect, and safety markers..."
                         if content_source == "Image to Text"
-                        else "Analyzing tone and safety markers..."
+                        else "Analyzing tone, aspect, and safety markers..."
                     )
                     with st.spinner(spinner_label):
                         try:
@@ -3299,6 +3422,9 @@ elif st.session_state.page == COMMUNICATION_PAGE:
                                 }
 
                             sentiment_label, sentiment_conf, sentiment_meta = sentiment_analyzer.analyze(analysis_text)
+                            aspect_results = {}
+                            if ASPECT_AVAILABLE and AspectSentimentAnalyzer is not None:
+                                aspect_results = AspectSentimentAnalyzer().analyze_aspects(analysis_text)
                             is_toxic, tox_conf, cats, explanation, tox_meta = toxicity_detector.predict(analysis_text)
                         except ValueError as e:
                             st.warning(str(e))
@@ -3322,6 +3448,7 @@ elif st.session_state.page == COMMUNICATION_PAGE:
                                 'text': analysis_text,
                                 'type': 'single',
                                 'meta': sentiment_meta,
+                                'aspects': aspect_results,
                                 'source_type': source_type,
                                 'source_name': source_name,
                             }
@@ -3438,7 +3565,8 @@ elif st.session_state.page == COMMUNICATION_PAGE:
 
     if communication_mode == "🧠 Unified Scan":
         single_sentiment = sentiment_result if sentiment_result and sentiment_result.get("type") == "single" else None
-        if single_sentiment or toxicity_result:
+        legacy_aspect_result = sentiment_result if sentiment_result and sentiment_result.get("type") == "aspect" else None
+        if single_sentiment or toxicity_result or legacy_aspect_result:
             st.markdown('<div class="animate-fade">', unsafe_allow_html=True)
             st.markdown("---")
             render_communication_summary(single_sentiment, toxicity_result)
@@ -3450,8 +3578,11 @@ elif st.session_state.page == COMMUNICATION_PAGE:
             if ocr_meta:
                 render_ocr_result_panel(ocr_meta, section_title="Image Reader")
             if single_sentiment:
-                st.markdown("### 😊 Sentiment Findings")
+                st.markdown("### Sentiment, Emotion & Aspect Findings")
                 render_sentiment_result_panel(single_sentiment)
+            elif legacy_aspect_result:
+                st.markdown("### Legacy Aspect Findings")
+                render_sentiment_result_panel(legacy_aspect_result)
             if toxicity_result:
                 st.markdown("### ⚠️ Safety Findings")
                 render_toxicity_result_panel(toxicity_result, ToxicityVisualizer)

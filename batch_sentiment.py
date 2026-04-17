@@ -92,10 +92,13 @@ class BatchSentimentProcessor:
             for text in batch:
                 try:
                     label, conf, meta = sentiment_analyzer.analyze(text)
+                    explanation = (meta.get('explanation') or {}).get('summary', '')
                     results.append({
                         'text': text[:100] + '...' if len(text) > 100 else text,
                         'sentiment': label,
                         'confidence': conf,
+                        'dominant_emotion': meta.get('dominant_emotion', 'balanced'),
+                        'explanation': explanation,
                         'language': meta.get('original_language', 'en'),
                         'length': len(text)
                     })

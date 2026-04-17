@@ -90,6 +90,16 @@ class SentimentAnalyzer:
             "excited": 0.9,
             "positive": 0.8,
             "relieved": 0.8,
+            "hopeful": 0.8,
+            "optimistic": 0.9,
+            "joyful": 1.0,
+            "pleased": 0.8,
+            "reassured": 0.8,
+            "comforted": 0.7,
+            "peaceful": 0.7,
+            "bright": 0.6,
+            "promising": 0.7,
+            "reassuring": 0.8,
         }
         self.negative_lexicon = {
             "bad": 0.8,
@@ -112,6 +122,19 @@ class SentimentAnalyzer:
             "negative": 0.8,
             "furious": 1.2,
             "concerned": 0.7,
+            "distress": 1.1,
+            "distressed": 1.1,
+            "devastated": 1.2,
+            "miserable": 1.0,
+            "stressed": 0.9,
+            "overwhelmed": 0.9,
+            "frustrating": 1.0,
+            "frustration": 0.9,
+            "helpless": 0.9,
+            "alarmed": 0.9,
+            "panic": 1.1,
+            "panicked": 1.1,
+            "stressful": 0.9,
         }
         self.negations = {
             "not",
@@ -155,11 +178,23 @@ class SentimentAnalyzer:
             "partly",
         }
         self.emotion_lexicon = {
-            "joy": {"happy", "glad", "love", "delighted", "excited", "cheerful", "thrilled", "great"},
+            "happiness": {
+                "happy", "glad", "love", "delighted", "excited", "cheerful",
+                "thrilled", "great", "joyful", "pleased", "smiling",
+            },
+            "relief": {"relieved", "reassured", "reassuring", "comforted", "finally", "safe", "settled"},
+            "optimism": {"hopeful", "optimistic", "promising", "encouraged", "confident", "bright"},
+            "trust": {"confident", "secure", "reliable", "safe", "steady", "certain", "assured", "reassuring"},
+            "surprise": {"surprised", "astonished", "shocked", "amazed", "unexpected", "wow"},
             "anger": {"angry", "furious", "hate", "annoyed", "outraged", "irritated", "mad"},
-            "sadness": {"sad", "disappointed", "down", "unhappy", "upset", "heartbroken", "depressed"},
-            "fear": {"worried", "afraid", "anxious", "concerned", "nervous", "scared", "uneasy"},
-            "trust": {"confident", "secure", "reliable", "safe", "steady", "certain"},
+            "frustration": {"frustrated", "frustrating", "stuck", "blocked", "annoyed", "irritated", "delayed"},
+            "sadness": {"sad", "disappointed", "down", "unhappy", "upset", "heartbroken", "depressed", "devastated"},
+            "distress": {
+                "distress", "distressed", "worried", "afraid", "anxious", "concerned",
+                "nervous", "scared", "uneasy", "panic", "panicked", "overwhelmed",
+                "shaken", "helpless", "stressed", "stressful",
+            },
+            "disgust": {"disgusted", "gross", "nasty", "revolting", "sickened"},
         }
 
         try:
@@ -242,14 +277,27 @@ class SentimentAnalyzer:
             sentiment_score = float(detail["signed_score"])
             agreement = 1.0
 
+        tone_features = dict(tone_features)
+        tone_features["dominant_emotion"] = self._resolve_dominant_emotion(tone_features, label)
+
+        explanation = self._build_explanation(
+            label=label,
+            confidence=conf,
+            sentiment_score=sentiment_score,
+            agreement=agreement,
+            tone_features=tone_features,
+            model_results=model_results,
+        )
         meta.update(
             {
                 "sentiment_score": sentiment_score,
                 "intensity": tone_features["intensity"],
                 "dominant_emotion": tone_features["dominant_emotion"],
                 "emotion_scores": tone_features["emotion_scores"],
+                "emotion_rankings": explanation["top_emotions"],
                 "tone_flags": tone_features["flags"],
                 "agreement": agreement,
+                "explanation": explanation,
                 "model_breakdown": [
                     {
                         "source": result["source"],
@@ -280,6 +328,171 @@ class SentimentAnalyzer:
             return "NEGATIVE"
         return "NEUTRAL"
 
+    def _emotion_alignment(self, emotion: str) -> int:
+        if emotion in {"happiness", "relief", "optimism", "trust"}:
+            return 1
+        if emotion in {"anger", "frustration", "sadness", "distress", "disgust"}:
+            return -1
+        return 0
+
+    def _select_dominant_emotion(self, emotion_scores: Counter, signed_score: float) -> str:
+        if not emotion_scores:
+            return "balanced"
+
+        def sort_key(item):
+            emotion, score = item
+            alignment = self._emotion_alignment(emotion)
+            if signed_score > 0.1:
+                alignment_bonus = 1 if alignment > 0 else 0
+            elif signed_score < -0.1:
+                alignment_bonus = 1 if alignment < 0 else 0
+            else:
+                alignment_bonus = 1 if alignment == 0 else 0
+            return (int(score), alignment_bonus, abs(alignment))
+
+        return max(emotion_scores.items(), key=sort_key)[0]
+
+    def _resolve_dominant_emotion(self, tone_features: Dict, label: str) -> str:
+        emotion_scores = Counter(tone_features.get("emotion_scores") or {})
+        if not emotion_scores:
+            return str(tone_features.get("dominant_emotion", "balanced"))
+
+        def sort_key(item):
+            emotion, score = item
+            alignment = self._emotion_alignment(emotion)
+            if label == "POSITIVE":
+                alignment_bonus = 1 if alignment > 0 else 0
+            elif label == "NEGATIVE":
+                alignment_bonus = 1 if alignment < 0 else 0
+            else:
+                alignment_bonus = 1 if alignment == 0 else 0
+            return (int(score), alignment_bonus, abs(alignment))
+
+        return max(emotion_scores.items(), key=sort_key)[0]
+
+    def _top_emotions(self, tone_features: Dict, limit: int = 3) -> List[Dict]:
+        emotion_scores = tone_features.get("emotion_scores") or {}
+        matched_emotion_terms = tone_features.get("matched_emotion_terms") or {}
+        ranked = sorted(emotion_scores.items(), key=lambda item: item[1], reverse=True)
+
+        if not ranked:
+            dominant_emotion = tone_features.get("dominant_emotion")
+            if dominant_emotion and dominant_emotion != "balanced":
+                ranked = [(dominant_emotion, 1)]
+
+        top_emotions: List[Dict] = []
+        for emotion, score in ranked[:limit]:
+            top_emotions.append(
+                {
+                    "emotion": emotion,
+                    "score": int(score),
+                    "terms": list((matched_emotion_terms.get(emotion) or [])[:3]),
+                }
+            )
+        return top_emotions
+
+    def _build_explanation(
+        self,
+        label: str,
+        confidence: float,
+        sentiment_score: float,
+        agreement: float,
+        tone_features: Dict,
+        model_results: List[Dict],
+    ) -> Dict:
+        positive_terms = list((tone_features.get("matched_positive_terms") or [])[:4])
+        negative_terms = list((tone_features.get("matched_negative_terms") or [])[:4])
+        matched_emotion_terms = tone_features.get("matched_emotion_terms") or {}
+        dominant_emotion = str(tone_features.get("dominant_emotion", "balanced")).replace("_", " ")
+        top_emotions = self._top_emotions(tone_features)
+        evidence: List[str] = []
+
+        if label == "POSITIVE":
+            if positive_terms:
+                evidence.append(f"Positive language outweighed negative cues: {', '.join(positive_terms)}.")
+            else:
+                evidence.append(f"The combined polarity score stayed above the positive threshold ({sentiment_score:+.2f}).")
+        elif label == "NEGATIVE":
+            if negative_terms:
+                evidence.append(f"Negative or critical wording dominated the message: {', '.join(negative_terms)}.")
+            else:
+                evidence.append(f"The combined polarity score stayed below the negative threshold ({sentiment_score:+.2f}).")
+        else:
+            if positive_terms and negative_terms:
+                evidence.append(
+                    f"Positive and negative cues were both present ({', '.join(positive_terms[:2])} vs {', '.join(negative_terms[:2])}), which balanced the final score."
+                )
+            else:
+                evidence.append("The wording stayed close to balanced, so the score remained in the neutral band.")
+
+        dominant_terms = list((matched_emotion_terms.get(tone_features.get("dominant_emotion")) or [])[:3])
+        if dominant_terms:
+            evidence.append(
+                f"Emotion cues pointed to {dominant_emotion} through words like {', '.join(dominant_terms)}."
+            )
+        elif dominant_emotion != "balanced":
+            evidence.append(f"The strongest emotional pattern aligned with {dominant_emotion}.")
+
+        flags = tone_features.get("flags") or []
+        emphasis_bits: List[str] = []
+        if "intensifier" in flags:
+            emphasis_bits.append("intensifiers")
+        if "strong_emphasis" in flags:
+            emphasis_bits.append("repeated exclamation")
+        if "all_caps_emphasis" in flags:
+            emphasis_bits.append("all-caps emphasis")
+        if emphasis_bits:
+            evidence.append(f"Intensity increased because of {', '.join(emphasis_bits)}.")
+        if "negation" in flags:
+            evidence.append("Negations were detected, which can flip the meaning of nearby words.")
+        if "mixed_polarity" in flags:
+            evidence.append("The text contains mixed polarity, so the model weighed conflicting cues together.")
+
+        if model_results:
+            label_counts = Counter(result["label"] for result in model_results)
+            support_count = label_counts.get(label, 0)
+            supporting_sources = [
+                str(result["source"]).upper()
+                for result in model_results
+                if result.get("label") == label
+            ]
+            if support_count:
+                evidence.append(
+                    f"{support_count} of {len(model_results)} analyzers supported the {label.lower()} conclusion ({', '.join(supporting_sources[:3])})."
+                )
+
+        emotion_suffix = (
+            f" Strongest emotion signal: {dominant_emotion}."
+            if dominant_emotion != "balanced"
+            else ""
+        )
+
+        if label == "POSITIVE":
+            summary = (
+                f"Detected a positive tone with {confidence:.0%} confidence because supportive wording outweighed "
+                f"negative signals.{emotion_suffix}"
+            )
+        elif label == "NEGATIVE":
+            summary = (
+                f"Detected a negative tone with {confidence:.0%} confidence because critical wording outweighed "
+                f"positive signals.{emotion_suffix}"
+            )
+        else:
+            summary = (
+                f"Detected a neutral tone with {confidence:.0%} confidence because the message stayed balanced "
+                f"or only showed mild emotional cues.{emotion_suffix}"
+            )
+
+        return {
+            "summary": summary,
+            "signal_evidence": evidence,
+            "top_emotions": top_emotions,
+            "matched_positive_terms": positive_terms,
+            "matched_negative_terms": negative_terms,
+            "matched_emotion_terms": matched_emotion_terms,
+            "agreement": float(agreement),
+        }
+
     def _extract_tone_features(self, text: str) -> Dict:
         raw_text = text or ""
         tokens = re.findall(r"[a-z']+", raw_text.lower())
@@ -288,6 +501,9 @@ class SentimentAnalyzer:
         negative_hits = 0
         flags: List[str] = []
         emotion_scores = Counter()
+        positive_terms: List[str] = []
+        negative_terms: List[str] = []
+        matched_emotion_terms: Dict[str, List[str]] = {}
         negation_scope = 0
 
         for idx, token in enumerate(tokens):
@@ -313,13 +529,20 @@ class SentimentAnalyzer:
             if token in self.positive_lexicon:
                 lexical_total += self.positive_lexicon[token] * modifier
                 positive_hits += 1
+                if token not in positive_terms:
+                    positive_terms.append(token)
             elif token in self.negative_lexicon:
                 lexical_total -= self.negative_lexicon[token] * modifier
                 negative_hits += 1
+                if token not in negative_terms:
+                    negative_terms.append(token)
 
             for emotion, words in self.emotion_lexicon.items():
                 if token in words:
                     emotion_scores[emotion] += 1
+                    matched_emotion_terms.setdefault(emotion, [])
+                    if token not in matched_emotion_terms[emotion]:
+                        matched_emotion_terms[emotion].append(token)
 
         signed_score = float(np.tanh(lexical_total / 3.0)) if lexical_total else 0.0
         exclamation_count = raw_text.count("!")
@@ -344,13 +567,15 @@ class SentimentAnalyzer:
             flags.append("all_caps_emphasis")
 
         if emotion_scores:
-            dominant_emotion = emotion_scores.most_common(1)[0][0]
-        elif signed_score > 0.25:
-            dominant_emotion = "joy"
-        elif signed_score < -0.45:
-            dominant_emotion = "anger"
+            dominant_emotion = self._select_dominant_emotion(emotion_scores, signed_score)
+        elif signed_score > 0.45:
+            dominant_emotion = "happiness"
+        elif signed_score > 0.18:
+            dominant_emotion = "optimism"
+        elif signed_score < -0.5:
+            dominant_emotion = "distress"
         elif signed_score < -0.18:
-            dominant_emotion = "sadness"
+            dominant_emotion = "frustration" if "strong_emphasis" in flags else "sadness"
         else:
             dominant_emotion = "balanced"
 
@@ -359,6 +584,9 @@ class SentimentAnalyzer:
             "intensity": intensity,
             "dominant_emotion": dominant_emotion,
             "emotion_scores": dict(emotion_scores),
+            "matched_positive_terms": positive_terms,
+            "matched_negative_terms": negative_terms,
+            "matched_emotion_terms": matched_emotion_terms,
             "flags": flags,
             "positive_hits": positive_hits,
             "negative_hits": negative_hits,

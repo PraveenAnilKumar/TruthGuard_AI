@@ -78,11 +78,19 @@ class AspectSentimentAnalyzer:
                     aspects_found[aspect] = aspect_sentiment
                 else:
                     # Analyze full text as fallback
-                    label, conf, _ = sentiment_analyzer.analyze(text)
+                    label, conf, meta = sentiment_analyzer.analyze(text)
                     aspects_found[aspect] = {
                         'label': label,
                         'confidence': conf,
-                        'sentences': []
+                        'dominant_emotion': meta.get('dominant_emotion', 'balanced'),
+                        'emotion_scores': meta.get('emotion_scores', {}),
+                        'explanation': {
+                            'summary': (
+                                f"{aspect.title()} was classified as {label.lower()} from the overall message context."
+                            ),
+                            'evidence': list((meta.get('explanation') or {}).get('signal_evidence', [])),
+                        },
+                        'sentences': [],
                     }
         
         return aspects_found
@@ -121,25 +129,68 @@ class AspectSentimentAnalyzer:
             Aggregated sentiment
         """
         if not sentences:
-            return {'label': 'NEUTRAL', 'confidence': 0.5, 'sentences': []}
-        
+            return {
+                'label': 'NEUTRAL',
+                'confidence': 0.5,
+                'dominant_emotion': 'balanced',
+                'emotion_scores': {},
+                'explanation': {
+                    'summary': 'No aspect-specific evidence was found, so the aspect result stayed neutral.',
+                    'evidence': [],
+                },
+                'sentences': [],
+            }
+
         results = []
+        emotion_scores = Counter()
         for sentence in sentences:
-            label, conf, _ = sentiment_analyzer.analyze(sentence)
+            label, conf, meta = sentiment_analyzer.analyze(sentence)
+            sentence_explanation = meta.get('explanation') or {}
+            dominant_emotion = meta.get('dominant_emotion', 'balanced')
+            for emotion, score in (meta.get('emotion_scores') or {}).items():
+                emotion_scores[emotion] += score
             results.append({
                 'sentence': sentence,
                 'label': label,
-                'confidence': conf
+                'confidence': conf,
+                'emotion': dominant_emotion,
+                'explanation': sentence_explanation.get('summary', ''),
+                'evidence': list(sentence_explanation.get('signal_evidence', [])),
             })
-        
+
         # Aggregate
         labels = [r['label'] for r in results]
-        most_common = Counter(labels).most_common(1)[0][0]
-        
+        label_counts = Counter(labels)
+        most_common = label_counts.most_common(1)[0][0]
         avg_confidence = sum(r['confidence'] for r in results) / len(results)
-        
+        dominant_emotion = 'balanced'
+        if emotion_scores:
+            if hasattr(sentiment_analyzer, "_resolve_dominant_emotion"):
+                dominant_emotion = sentiment_analyzer._resolve_dominant_emotion(
+                    {
+                        'emotion_scores': dict(emotion_scores),
+                        'dominant_emotion': emotion_scores.most_common(1)[0][0],
+                    },
+                    most_common,
+                )
+            else:
+                dominant_emotion = emotion_scores.most_common(1)[0][0]
+        strongest_sentences = sorted(results, key=lambda item: item['confidence'], reverse=True)[:2]
+        sentence_refs = [item['sentence'] for item in strongest_sentences]
+
         return {
             'label': most_common,
             'confidence': avg_confidence,
-            'sentences': results
+            'dominant_emotion': dominant_emotion,
+            'emotion_scores': dict(emotion_scores),
+            'explanation': {
+                'summary': (
+                    f"{label_counts.get(most_common, 0)} of {len(results)} aspect-specific sentence(s) leaned "
+                    f"{most_common.lower()}, with {dominant_emotion.replace('_', ' ')} as the strongest emotion."
+                ),
+                'evidence': [
+                    "Strongest evidence came from: " + " | ".join(sentence_refs)
+                ] if sentence_refs else [],
+            },
+            'sentences': results,
         }
