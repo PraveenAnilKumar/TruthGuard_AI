@@ -70,131 +70,79 @@ class SentimentAnalyzer:
         self.ensemble_models: List[str] = []
         self.ensemble_names: List[str] = []
         self.positive_lexicon = {
-            "good": 0.8,
-            "great": 1.0,
-            "excellent": 1.2,
-            "amazing": 1.2,
-            "love": 1.3,
-            "best": 1.0,
-            "fantastic": 1.2,
-            "wonderful": 1.1,
-            "awesome": 1.1,
-            "happy": 0.9,
-            "glad": 0.8,
-            "grateful": 0.9,
-            "helpful": 0.7,
-            "calm": 0.6,
-            "confident": 0.8,
-            "impressed": 0.8,
-            "delightful": 1.0,
-            "excited": 0.9,
-            "positive": 0.8,
-            "relieved": 0.8,
-            "hopeful": 0.8,
-            "optimistic": 0.9,
-            "joyful": 1.0,
-            "pleased": 0.8,
-            "reassured": 0.8,
-            "comforted": 0.7,
-            "peaceful": 0.7,
-            "bright": 0.6,
-            "promising": 0.7,
-            "reassuring": 0.8,
+            "good": 0.8, "great": 1.0, "excellent": 1.2, "amazing": 1.2, "love": 1.3,
+            "best": 1.0, "fantastic": 1.2, "wonderful": 1.1, "awesome": 1.1, "happy": 0.9,
+            "glad": 0.8, "grateful": 0.9, "helpful": 0.7, "calm": 0.6, "confident": 0.8,
+            "impressed": 0.8, "delightful": 1.0, "excited": 0.9, "positive": 0.8, "relieved": 0.8,
+            "hopeful": 0.8, "optimistic": 0.9, "joyful": 1.0, "pleased": 0.8, "reassured": 0.8,
+            "comforted": 0.7, "peaceful": 0.7, "bright": 0.6, "promising": 0.7, "reassuring": 0.8,
+            # Newly expanded vocabulary
+            "thrilled": 1.1, "ecstatic": 1.2, "proud": 0.9, "hero": 1.1, "triumph": 1.1, 
+            "brave": 0.9, "beautiful": 1.0, "magnificent": 1.2, "stellar": 1.1, "perfect": 1.2,
+            "superb": 1.1, "spectacular": 1.2, "brilliant": 1.1, "genius": 1.1, "victory": 1.1,
+            "inspired": 0.9, "fascinated": 0.8, "thankful": 0.9, "appreciation": 0.8,
+            "curious": 0.6, "eager": 0.7, "fascinating": 0.9, "wonder": 0.9, "awe": 1.0, 
+            "masterpiece": 1.2, "flawless": 1.2, "succeed": 1.0, "successful": 0.9, "blessed": 1.0
         }
         self.negative_lexicon = {
-            "bad": 0.8,
-            "terrible": 1.2,
-            "awful": 1.1,
-            "hate": 1.3,
-            "worst": 1.2,
-            "horrible": 1.2,
-            "disappointing": 1.0,
-            "poor": 0.8,
-            "sad": 0.8,
-            "angry": 1.0,
-            "upset": 0.9,
-            "frustrated": 0.9,
-            "worried": 0.8,
-            "anxious": 0.9,
-            "annoying": 0.9,
-            "broken": 0.9,
-            "useless": 1.0,
-            "negative": 0.8,
-            "furious": 1.2,
-            "concerned": 0.7,
-            "distress": 1.1,
-            "distressed": 1.1,
-            "devastated": 1.2,
-            "miserable": 1.0,
-            "stressed": 0.9,
-            "overwhelmed": 0.9,
-            "frustrating": 1.0,
-            "frustration": 0.9,
-            "helpless": 0.9,
-            "alarmed": 0.9,
-            "panic": 1.1,
-            "panicked": 1.1,
-            "stressful": 0.9,
+            "bad": 0.8, "terrible": 1.2, "awful": 1.1, "hate": 1.3, "worst": 1.2,
+            "horrible": 1.2, "disappointing": 1.0, "poor": 0.8, "sad": 0.8, "angry": 1.0,
+            "upset": 0.9, "frustrated": 0.9, "worried": 0.8, "anxious": 0.9, "annoying": 0.9,
+            "broken": 0.9, "useless": 1.0, "negative": 0.8, "furious": 1.2, "concerned": 0.7,
+            "distress": 1.1, "distressed": 1.1, "devastated": 1.2, "miserable": 1.0, "stressed": 0.9,
+            "overwhelmed": 0.9, "frustrating": 1.0, "frustration": 0.9, "helpless": 0.9, "alarmed": 0.9,
+            "panic": 1.1, "panicked": 1.1, "stressful": 0.9,
+            # Newly expanded vocabulary
+            "dread": 1.1, "terrified": 1.2, "scared": 1.0, "fear": 1.1, "phobia": 1.0,
+            "disgust": 1.2, "revolted": 1.2, "sickened": 1.2, "gross": 1.0, "repulsive": 1.1,
+            "scorn": 1.1, "disdain": 1.1, "contempt": 1.2, "pathetic": 1.2, "worthless": 1.2,
+            "guilt": 0.9, "ashamed": 0.9, "remorse": 0.9, "regret": 0.8, "apologetic": 0.6,
+            "lonely": 0.9, "isolated": 0.9, "abandoned": 1.1, "rejected": 1.1, "betrayed": 1.2,
+            "jealous": 0.9, "envious": 0.9, "bitter": 1.0, "resentful": 1.0, "boring": 0.7,
+            "dull": 0.7, "tired": 0.6, "exhausted": 0.8, "trash": 1.1, "garbage": 1.1, "fail": 1.0, 
+            "failure": 1.2, "disaster": 1.2, "tragedy": 1.2, "cruel": 1.1, "evil": 1.3
         }
         self.negations = {
-            "not",
-            "no",
-            "never",
-            "don't",
-            "didn't",
-            "isn't",
-            "wasn't",
-            "can't",
-            "couldn't",
-            "won't",
-            "wouldn't",
-            "shouldn't",
-            "ain't",
+            "not", "no", "never", "don't", "didn't", "isn't", "wasn't", "can't",
+            "couldn't", "won't", "wouldn't", "shouldn't", "ain't",
         }
         self.intensifiers = {
-            "very",
-            "extremely",
-            "really",
-            "absolutely",
-            "incredibly",
-            "deeply",
-            "highly",
-            "so",
-            "too",
-            "truly",
-            "remarkably",
-            "especially",
+            "very", "extremely", "really", "absolutely", "incredibly", "deeply",
+            "highly", "so", "too", "truly", "remarkably", "especially",
         }
         self.downtoners = {
-            "slightly",
-            "somewhat",
-            "fairly",
-            "barely",
-            "maybe",
-            "perhaps",
-            "kind",
-            "sort",
-            "mostly",
-            "partly",
+            "slightly", "somewhat", "fairly", "barely", "maybe", "perhaps",
+            "kind", "sort", "mostly", "partly",
         }
+        
+        # Radically expanded emotion lexicon
         self.emotion_lexicon = {
-            "happiness": {
-                "happy", "glad", "love", "delighted", "excited", "cheerful",
-                "thrilled", "great", "joyful", "pleased", "smiling",
-            },
+            # Positive cluster
+            "happiness": {"happy", "glad", "love", "delighted", "excited", "cheerful", "thrilled", "great", "joyful", "pleased", "smiling", "ecstatic"},
             "relief": {"relieved", "reassured", "reassuring", "comforted", "finally", "safe", "settled"},
             "optimism": {"hopeful", "optimistic", "promising", "encouraged", "confident", "bright"},
-            "trust": {"confident", "secure", "reliable", "safe", "steady", "certain", "assured", "reassuring"},
-            "surprise": {"surprised", "astonished", "shocked", "amazed", "unexpected", "wow"},
-            "anger": {"angry", "furious", "hate", "annoyed", "outraged", "irritated", "mad"},
+            "trust": {"confident", "secure", "reliable", "safe", "steady", "certain", "assured", "reassuring", "truth"},
+            "gratitude": {"gratitude", "thankful", "thanks", "appreciation", "appreciate", "blessed"},
+            "pride": {"proud", "triumph", "victory", "success", "hero", "achieve", "honor"},
+            "awe": {"awe", "wonder", "inspired", "fascinated", "fascinating", "magnificent", "masterpiece", "spectacular", "wow"},
+            "anticipation": {"anticipation", "eager", "expecting", "curious", "ready", "looking forward", "excited"},
+            
+            # Neutral / Cognitive cluster
+            "surprise": {"surprised", "astonished", "shocked", "amazed", "unexpected", "startled", "stunned"},
+            "confusion": {"confusion", "confused", "baffled", "unsure", "skeptical", "unclear", "lost", "doubt", "perplexed"},
+            
+            # Negative cluster
+            "anger": {"angry", "furious", "hate", "annoyed", "outraged", "irritated", "mad", "rage", "bitter", "resentful"},
             "frustration": {"frustrated", "frustrating", "stuck", "blocked", "annoyed", "irritated", "delayed"},
-            "sadness": {"sad", "disappointed", "down", "unhappy", "upset", "heartbroken", "depressed", "devastated"},
-            "distress": {
-                "distress", "distressed", "worried", "afraid", "anxious", "concerned",
-                "nervous", "scared", "uneasy", "panic", "panicked", "overwhelmed",
-                "shaken", "helpless", "stressed", "stressful",
-            },
-            "disgust": {"disgusted", "gross", "nasty", "revolting", "sickened"},
+            "sadness": {"sad", "disappointed", "down", "unhappy", "upset", "heartbroken", "depressed", "devastated", "tragedy"},
+            "distress": {"distress", "distressed", "worried", "uneasy", "overwhelmed", "shaken", "helpless", "stressed", "stressful"},
+            "fear": {"fear", "afraid", "scared", "terrified", "panic", "panicked", "phobia", "dread", "anxious", "nervous"},
+            "disgust": {"disgusted", "gross", "nasty", "revolting", "sickened", "repulsive", "trash"},
+            "contempt": {"contempt", "scorn", "disdain", "pathetic", "worthless", "loser", "arrogant"},
+            "guilt": {"guilt", "guilty", "ashamed", "remorse", "regret", "apologetic", "sorry", "fault"},
+            "loneliness": {"lonely", "alone", "isolated", "abandoned", "rejected"},
+            "envy": {"envy", "envious", "jealous", "jealousy", "covet"},
+            "boredom": {"boredom", "bored", "dull", "indifferent", "uninterested", "meh", "tired", "exhausted"}
         }
 
         try:
@@ -329,9 +277,12 @@ class SentimentAnalyzer:
         return "NEUTRAL"
 
     def _emotion_alignment(self, emotion: str) -> int:
-        if emotion in {"happiness", "relief", "optimism", "trust"}:
+        positives = {"happiness", "relief", "optimism", "trust", "gratitude", "pride", "awe", "anticipation"}
+        negatives = {"anger", "frustration", "sadness", "distress", "fear", "disgust", "contempt", "guilt", "loneliness", "envy", "boredom"}
+        
+        if emotion in positives:
             return 1
-        if emotion in {"anger", "frustration", "sadness", "distress", "disgust"}:
+        if emotion in negatives:
             return -1
         return 0
 

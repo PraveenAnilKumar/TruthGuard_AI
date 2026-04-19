@@ -807,6 +807,7 @@ default_state = {
     'communication_image_upload_nonce': 0,
     'fn_check_realtime': True,
     'fn_image_upload_nonce': 0,
+    'rt_image_upload_nonce': 0,
     'last_toxicity': None,
     'toxicity_train_data': None,
     'fn_verification_result': None,
@@ -1238,6 +1239,208 @@ def render_ocr_result_panel(ocr_meta, section_title="Image Reader"):
         st.caption(f"OCR working size: {int(preprocessed_size[0])} × {int(preprocessed_size[1])}")
 
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_realtime_verdict_card(res: dict, claim_text: str):
+    """
+    Render a full prediction verdict card for the Real-time Verification tab.
+    Shows: prediction label, confidence, consensus tier, reasoning, and sources.
+    """
+    if not res:
+        return
+
+    status = res.get('status', 'NO_RESULTS')
+    consensus = float(res.get('consensus_score', 0.0))
+    verdict_code = str(res.get('verdict_code', 'UNVERIFIED') or 'UNVERIFIED')
+    contradiction = float(res.get('contradiction_score', 0.0))
+
+    # ── Derive prediction label from consensus ────────────────────────
+    if status == 'NO_RESULTS':
+        pred_label = 'UNVERIFIABLE'
+        pred_icon  = '🔘'
+        pred_color = '#64748b'
+        pred_bg    = 'rgba(100,116,139,0.12)'
+        pred_border= '#475569'
+        verdict_text = 'No Live Corroboration Found'
+        verdict_sub  = 'This claim could not be matched to any mainstream news source currently in circulation.'
+    elif verdict_code == 'CONTRADICTED_BY_SOURCES' or contradiction >= 0.25:
+        pred_label = 'FRAUDULENT / MISLEADING'
+        pred_icon  = '❌'
+        pred_color = '#ef4444'
+        pred_bg    = 'rgba(239,68,68,0.10)'
+        pred_border= '#ef4444'
+        verdict_text = 'Contradicted by Live Sources'
+        verdict_sub  = 'Active news reporting directly contradicts key details of this claim.'
+    elif consensus >= 0.72 and verdict_code == 'VERIFIED_ONLINE':
+        pred_label = 'VERIFIED'
+        pred_icon  = '✅'
+        pred_color = '#10b981'
+        pred_bg    = 'rgba(16,185,129,0.10)'
+        pred_border= '#10b981'
+        verdict_text = 'Verified by Live News Consensus'
+        verdict_sub  = 'Multiple reputable sources corroborate this claim with strong factual overlap.'
+    elif consensus >= 0.45:
+        pred_label = 'PARTIALLY CREDIBLE'
+        pred_icon  = '⚠️'
+        pred_color = '#f59e0b'
+        pred_bg    = 'rgba(245,158,11,0.10)'
+        pred_border= '#f59e0b'
+        verdict_text = 'Partial Corroboration Found'
+        verdict_sub  = 'Some reporting aligns with this claim, but full corroboration from reputable sources is limited.'
+    elif consensus >= 0.20:
+        pred_label = 'UNCERTAIN'
+        pred_icon  = '❓'
+        pred_color = '#a78bfa'
+        pred_bg    = 'rgba(167,139,250,0.10)'
+        pred_border= '#7c3aed'
+        verdict_text = 'Weak or Marginal Evidence'
+        verdict_sub  = 'Very limited news overlap found. Treat this claim with caution.'
+    else:
+        pred_label = 'UNVERIFIED'
+        pred_icon  = '🚫'
+        pred_color = '#f97316'
+        pred_bg    = 'rgba(249,115,22,0.10)'
+        pred_border= '#f97316'
+        verdict_text = 'Not Reflected in Mainstream Reporting'
+        verdict_sub  = 'This claim is not being reported by credible mainstream outlets.'
+
+    confidence_pct = f'{consensus:.1%}' if status != 'NO_RESULTS' else 'N/A'
+
+    st.markdown(
+        f"""
+        <div style="
+            background:{pred_bg};
+            border:2px solid {pred_border};
+            border-radius:14px;
+            padding:22px 26px 18px 26px;
+            margin:12px 0 18px 0;
+        ">
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:8px;">
+                <span style="font-size:2.2rem;">{pred_icon}</span>
+                <div>
+                    <div style="font-size:1.35rem;font-weight:800;color:{pred_color};letter-spacing:0.04em;">
+                        {pred_label}
+                    </div>
+                    <div style="font-size:0.92rem;color:#94a3b8;margin-top:2px;">
+                        {verdict_text}
+                    </div>
+                </div>
+                <div style="margin-left:auto;text-align:right;">
+                    <div style="font-size:1.6rem;font-weight:700;color:{pred_color};">{confidence_pct}</div>
+                    <div style="font-size:0.78rem;color:#64748b;">consensus confidence</div>
+                </div>
+            </div>
+            <div style="font-size:0.88rem;color:#cbd5e1;border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;margin-top:6px;">
+                {verdict_sub}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Metrics row
+    if status != 'NO_RESULTS':
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Consensus Score", f"{consensus:.1%}")
+        with m2:
+            st.metric("Contradiction Index", f"{contradiction:.1%}")
+        with m3:
+            sources = res.get('sources', [])
+            st.metric("Sources Matched", len(sources))
+        with m4:
+            top_cred = max((s.get('credibility_score', 0) for s in sources), default=0.0)
+            st.metric("Top Source Credibility", f"{top_cred:.0%}")
+
+    # Claim display
+    if claim_text:
+        with st.expander("📌 Claim / Extracted Text Used", expanded=False):
+            st.text_area(
+                "Input claim",
+                value=claim_text,
+                height=90,
+                disabled=True,
+                key=f"rt_verdict_claim_{hash(claim_text) & 0xFFFF}",
+            )
+
+    st.caption(f"Verdict code: `{verdict_code}` | {res.get('message', '')}")
+
+
+def render_credibility_report_panel(credibility_report: dict):
+    """
+    Render the heuristic credibility breakdown from _compute_credibility_report()
+    inside an expander. Shown in Direct Verification results.
+    """
+    if not credibility_report:
+        return
+
+    tier = credibility_report.get('tier', 'UNCERTAIN')
+    tier_label = credibility_report.get('tier_label', tier)
+    cred_score = float(credibility_report.get('credibility_score', 0.5))
+    flags = credibility_report.get('flags', [])
+    positives = credibility_report.get('positives', [])
+    dims = credibility_report.get('dimensions', {})
+
+    tier_cfg = {
+        'CREDIBLE':   ('#10b981', '✅'),
+        'UNCERTAIN':  ('#f59e0b', '❓'),
+        'SUSPICIOUS': ('#f97316', '⚠️'),
+        'FRAUDULENT': ('#ef4444', '🚫'),
+    }
+    color, icon = tier_cfg.get(tier, ('#94a3b8', '🔘'))
+
+    with st.expander(f"{icon} Credibility Analysis — {tier_label} ({cred_score:.0%} score)", expanded=False):
+        st.markdown(
+            f"<div style='margin-bottom:8px;font-size:0.85rem;color:#94a3b8;'>Multi-signal heuristic analysis of writing style, sourcing quality, sensationalism, and conspiracy indicators.</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Dimension bars
+        dim_labels = {
+            'sourcing': ('🔗 Sourcing Quality', True),
+            'institution_mentions': ('🏦 Institution Mentions', True),
+            'claim_density': ('📊 Specific Claims / Figures', True),
+            'structure': ('✍️ Writing Structure', True),
+            'sensationalism': ('📣 Sensationalism', False),
+            'absolutism_penalty': ('⚠️ Absolute Language', False),
+            'conspiracy_penalty': ('🔍 Conspiracy Signals', False),
+            'propaganda_penalty': ('🏳️ Polarizing Language', False),
+        }
+        if dims:
+            col_a, col_b = st.columns(2)
+            items = list(dim_labels.items())
+            for idx, (key, (lbl, positive)) in enumerate(items):
+                val = float(dims.get(key, 0.0))
+                bar_color = '#10b981' if positive else '#ef4444'
+                col = col_a if idx % 2 == 0 else col_b
+                with col:
+                    st.markdown(
+                        f"<div style='font-size:0.78rem;color:#94a3b8;margin-bottom:2px;'>{lbl}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.progress(min(val, 1.0))
+
+        # Flags and positives
+        f_col, p_col = st.columns(2)
+        with f_col:
+            if flags:
+                st.markdown("**🚩 Warning signals**")
+                for f in flags:
+                    st.markdown(f"- {f}")
+            else:
+                st.success("No major warning signals found.")
+        with p_col:
+            if positives:
+                st.markdown("**✅ Credibility signals**")
+                for p in positives:
+                    st.markdown(f"- {p}")
+            else:
+                st.info("No strong credibility signals detected.")
+
+        wc = credibility_report.get('word_count', 0)
+        sc = credibility_report.get('sentence_count', 0)
+        if wc:
+            st.caption(f"Analysed: {wc} words across {sc} sentence(s).")
 
 
 def render_sentiment_result_panel(result):
@@ -2895,9 +3098,10 @@ elif st.session_state.page == "Fake News Detection":
     st.markdown('<div class="glass-card animate-fade">', unsafe_allow_html=True)
     methods = ["📝 Direct Verification", "📁 Bulk Processing"]
     if REALTIME_AVAILABLE:
-        methods.append("📡 Real-time Verification")
+        methods = ["📡 Real-time Verification"] + methods
 
-    method = _segmented_control("Analysis Method", methods, default="📝 Direct Verification")
+    _default_method = "📡 Real-time Verification" if REALTIME_AVAILABLE else "📝 Direct Verification"
+    method = _segmented_control("Analysis Method", methods, default=_default_method)
 
     if 'last_fn_method' not in st.session_state:
         st.session_state.last_fn_method = method
@@ -2916,32 +3120,140 @@ elif st.session_state.page == "Fake News Detection":
         st.markdown("### 📡 Real-time Consensus Check")
         st.info("This tool verifies claims against live news feeds to check for factual consistency and cross-source reporting.")
 
-        claim_text = st.text_area("Enter Claim or Headline", height=100, placeholder="e.g., Global trade deal signed between X and Y...")
+        # --- Input mode selector (Text or Image) ---
+        rt_input_mode = _segmented_control(
+            "Input Source",
+            ["✏️ Enter Claim Text", "🖼️ Upload Claim Image"],
+            default=st.session_state.get("rt_input_mode", "✏️ Enter Claim Text"),
+            key="rt_input_mode",
+        )
 
-        if st.button("🌐 Verify Against Live News", width="stretch") and claim_text.strip():
-            with st.spinner("Scanning global news cycles..."):
-                if realtime_verifier is not None:
-                    res = realtime_verifier.verify_claim(claim_text)
-                    st.session_state.fn_verification_result = res
+        claim_text = ""
+        rt_ocr_meta = None
+        rt_uploaded_image = None
+
+        if rt_input_mode == "✏️ Enter Claim Text":
+            claim_text = st.text_area(
+                "Enter Claim or Headline",
+                height=100,
+                placeholder="e.g., Global trade deal signed between X and Y...",
+                key="rt_claim_text_input",
+            )
+        else:
+            # --- Image uploader for Real-time Verification ---
+            rt_image_reader_status = get_image_reader_status()
+            if rt_image_reader_status.get("available"):
+                st.caption("Upload a screenshot or scan of a news headline/article. The text will be extracted and verified against live news.")
+            else:
+                st.warning(
+                    f"Image reader unavailable: {rt_image_reader_status.get('error', 'No OCR backend detected.')}  \n"
+                    "You can still use **Enter Claim Text** mode above."
+                )
+
+            rt_uploader_key = f"rt_image_upload_{st.session_state.get('rt_image_upload_nonce', 0)}"
+            rt_uploaded_image = st.file_uploader(
+                "Upload Claim Image",
+                type=['png', 'jpg', 'jpeg', 'bmp', 'webp', 'tif', 'tiff'],
+                key=rt_uploader_key,
+                help="Supports screenshots, scanned prints, and social-media news cards.",
+            )
+
+            if rt_uploaded_image is not None:
+                try:
+                    rt_preview_image = _load_uploaded_image(
+                        rt_uploaded_image,
+                        max_size=(1400, 1400),
+                        label="Claim image upload",
+                    )
+                    st.image(rt_preview_image, caption="Uploaded claim image", width="stretch")
+                except Exception as _rt_img_err:
+                    rt_uploaded_image = None
+                    st.error(f"Could not open the uploaded image: {_rt_img_err}")
+
+        _rt_verify_ready = (
+            (rt_input_mode == "✏️ Enter Claim Text" and bool(claim_text.strip()))
+            or (rt_input_mode == "🖼️ Upload Claim Image" and rt_uploaded_image is not None)
+        )
+
+        rt_btn_col, rt_reset_col = st.columns([3, 1])
+        with rt_btn_col:
+            _rt_verify_clicked = st.button("🌐 Verify Against Live News", width="stretch", key="btn_rt_verify")
+        with rt_reset_col:
+            if st.button("🗑️ Clear", width="stretch", key="btn_rt_clear"):
+                st.session_state.fn_verification_result = None
+                st.session_state.rt_image_upload_nonce = st.session_state.get("rt_image_upload_nonce", 0) + 1
+                st.rerun()
+
+        if _rt_verify_clicked:
+            if not _rt_verify_ready:
+                if rt_input_mode == "✏️ Enter Claim Text":
+                    st.warning("Please enter a claim or headline to verify.")
                 else:
-                    st.error("📡 Real-time engine is not initialized. Please refresh or check logs.")
+                    st.warning("Please upload an image containing the claim to verify.")
+            else:
+                with st.spinner("Scanning global news cycles..."):
+                    _rt_claim_to_verify = claim_text.strip()
+                    _rt_extracted_ocr = None
+
+                    # --- OCR path: extract text from image first ---
+                    if rt_input_mode == "🖼️ Upload Claim Image" and rt_uploaded_image is not None:
+                        _rt_img_reader_status = get_image_reader_status()
+                        if not _rt_img_reader_status.get("available"):
+                            st.error(
+                                f"Image reader is unavailable: {_rt_img_reader_status.get('error', 'No OCR backend detected.')}  \n"
+                                "Please switch to **Enter Claim Text** mode."
+                            )
+                            st.stop()
+                        try:
+                            _rt_ocr_payload = extract_text_from_image(
+                                rt_uploaded_image,
+                                image_name=getattr(rt_uploaded_image, "name", None),
+                            )
+                            _rt_claim_to_verify = str(_rt_ocr_payload.get("text", "")).strip()
+                            _rt_extracted_ocr = {
+                                "extracted_text": _rt_claim_to_verify,
+                                "image_name": _rt_ocr_payload.get("image_name") or getattr(rt_uploaded_image, "name", None),
+                                "backend": _rt_ocr_payload.get("backend", "windows_ocr"),
+                                "line_count": _rt_ocr_payload.get("line_count", 0),
+                                "word_count": _rt_ocr_payload.get("word_count", 0),
+                                "language": _rt_ocr_payload.get("language", ""),
+                                "width": _rt_ocr_payload.get("width"),
+                                "height": _rt_ocr_payload.get("height"),
+                                "preprocessed_size": _rt_ocr_payload.get("preprocessed_size"),
+                            }
+                            if not _rt_claim_to_verify:
+                                st.warning("No text could be extracted from the uploaded image. Try a clearer screenshot or use the text input mode.")
+                                st.stop()
+                        except Exception as _rt_ocr_err:
+                            st.error(f"Image text extraction failed: {_rt_ocr_err}")
+                            st.stop()
+
+                    # --- Realtime verification ---
+                    if realtime_verifier is not None and _rt_claim_to_verify:
+                        _rt_res = realtime_verifier.verify_claim(_rt_claim_to_verify)
+                        # Attach OCR metadata so results panel can display it
+                        _rt_res["_ocr_meta"] = _rt_extracted_ocr
+                        _rt_res["_source_claim"] = _rt_claim_to_verify
+                        st.session_state.fn_verification_result = _rt_res
+                        st.rerun()
+                    else:
+                        st.error("📡 Real-time engine is not initialized. Please refresh or check logs.")
 
         if st.session_state.fn_verification_result:
             res = st.session_state.fn_verification_result
+            _rt_display_claim = res.get("_source_claim") or claim_text
             st.markdown("---")
-            if res['status'] == 'NO_RESULTS':
-                st.warning("No significant matching news reports found for this claim in the current cycle.")
-            else:
-                consensus = res['consensus_score']
-                st.markdown(f"#### Consensus Score: {consensus:.1%}")
-                st.progress(consensus)
-                if consensus > 0.6:
-                    st.success("✅ HIGH CONSENSUS: Multiple reputable sources are reporting similar information.")
-                elif consensus > 0.3:
-                    st.warning("⚠️ PARTIAL MATCH: Some news matches were found, but details may differ.")
-                else:
-                    st.error("🚨 NO CONSENSUS: This claim is not being reflected in mainstream news reports.")
-            render_live_news_comparison(res, claim_text)
+
+            # Show OCR panel if the result came from an image
+            _rt_ocr_meta_display = res.get("_ocr_meta")
+            if _rt_ocr_meta_display:
+                render_ocr_result_panel(_rt_ocr_meta_display, section_title="📷 Image Reader — Extracted Text")
+
+            # Full verdict prediction card
+            render_realtime_verdict_card(res, _rt_display_claim)
+
+            if res['status'] != 'NO_RESULTS':
+                render_live_news_comparison(res, _rt_display_claim)
 
     elif method == "📝 Direct Verification":
         if st.session_state.clear_fn:
@@ -3105,6 +3417,16 @@ elif st.session_state.page == "Fake News Detection":
 
             if res.get('meta') and res['meta'].get('ocr'):
                 render_ocr_result_panel(res['meta']['ocr'], section_title="Image Reader")
+
+            # Credibility heuristic breakdown
+            _fn_cred_report = (res.get('meta') or {}).get('credibility_report')
+            if _fn_cred_report:
+                render_credibility_report_panel(_fn_cred_report)
+
+            # Credibility impact note from model adjustments
+            _fn_cred_impact = (res.get('meta') or {}).get('credibility_impact')
+            if _fn_cred_impact:
+                st.caption(f"💡 Credibility adjustment: {_fn_cred_impact}")
 
             rt = res.get('meta', {}).get('realtime_result') if res.get('meta') else None
 

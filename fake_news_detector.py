@@ -620,6 +620,209 @@ class FakeNewsDetector:
             score += 0.1
         return min(score, 1.0)
 
+    def _compute_credibility_report(self, text: str) -> Dict[str, Any]:
+        """
+        Aggressive multi-signal credibility analysis.
+        Returns a structured report with per-dimension scores and an overall
+        credibility_score (0.0 = completely fraudulent, 1.0 = fully credible).
+        Safe to call on any text; never raises.
+        """
+        try:
+            text = _coerce_text(text)
+            tl = text.lower()
+            words = text.split()
+            word_count = max(len(words), 1)
+            sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+            sent_count = max(len(sentences), 1)
+
+            # ── 1. Sourcing & Attribution signals ────────────────────────
+            sourcing_positive = [
+                'according to', 'sources say', 'officials said', 'spokesperson',
+                'study shows', 'research published', 'peer-reviewed', 'data shows',
+                'confirmed by', 'verified by', 'cited', 'referenced', 'report by',
+                'journalists', 'investigation found', 'court documents', 'records show',
+                'press release', 'statement from', 'ministry of', 'department of',
+            ]
+            sourcing_negative = [
+                'anonymous', 'some people say', 'many believe', 'everyone knows',
+                'they say', 'rumor has it', 'insider claims', 'unnamed source',
+                'word on the street', 'i heard', 'apparently', 'supposedly',
+                'sources close to', 'unconfirmed', 'allegedly', 'speculated',
+            ]
+            src_pos = sum(1 for p in sourcing_positive if p in tl)
+            src_neg = sum(1 for n in sourcing_negative if n in tl)
+            sourcing_score = float(np.clip((src_pos * 0.15 - src_neg * 0.12 + 0.3), 0.0, 1.0))
+
+            # ── 2. Sensationalism & Emotional manipulation ────────────────
+            sensational_triggers = [
+                'shocking', 'explosive', 'bombshell', 'outrage', 'scandal',
+                "you won't believe", 'unbelievable', 'jaw-dropping', 'terrifying',
+                'disgusting', 'heartbreaking', 'mind-blowing', 'enraging',
+                'must read', 'must see', 'share this', 'spread the word',
+                'wake up', 'sheeple', 'blind', 'brainwashed', 'censored',
+                'they hide', 'deep state', 'shadow government', 'cover-up',
+                'they don\'t want you', 'hidden truth', 'forbidden knowledge',
+            ]
+            sens_count = sum(1 for t in sensational_triggers if t in tl)
+            # Exclamation & caps abuse
+            excl_ratio = text.count('!') / word_count
+            caps_words = sum(1 for w in words if w.isupper() and len(w) > 2)
+            caps_ratio = caps_words / word_count
+            sensationalism_score = float(np.clip(
+                sens_count * 0.1 + excl_ratio * 0.5 + caps_ratio * 0.4, 0.0, 1.0
+            ))
+
+            # ── 3. Writing quality & Structure ───────────────────────────
+            avg_sent_len = word_count / sent_count
+            # Very short sentences → tabloid-style. Very long → academic.
+            if avg_sent_len < 8:
+                structure_score = 0.35
+            elif avg_sent_len > 30:
+                structure_score = 0.75
+            else:
+                structure_score = float(np.clip(0.35 + (avg_sent_len - 8) / 22 * 0.50, 0.0, 1.0))
+
+            # Paragraph-like structure (presence of periods)
+            period_density = text.count('.') / word_count
+            if period_density > 0.04:
+                structure_score = min(structure_score + 0.1, 1.0)
+
+            # ── 4. Claim density (specific numbers & dates increase credibility) ─
+            numbers = re.findall(r'\b\d{4}\b|\d+\.\d+%?|\$\d+|\d+\s*(?:million|billion|thousand)', text)
+            date_patterns = re.findall(
+                r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}\b',
+                text,
+            )
+            claim_density_raw = (len(numbers) * 0.12 + len(date_patterns) * 0.15)
+            claim_density_score = float(np.clip(claim_density_raw, 0.0, 0.6))
+
+            # ── 5. Persuasion & Absolute language ────────────────────────
+            absolute_terms = [
+                'always', 'never', 'everyone', 'nobody', 'all',
+                'proven fact', 'undeniable', 'irrefutable', 'the truth is',
+                'fact:', 'fact -', '100%', 'definitely', 'certainly', 'obviously',
+            ]
+            abs_count = sum(1 for t in absolute_terms if t in tl)
+            absolutism_penalty = float(np.clip(abs_count * 0.08, 0.0, 0.35))
+
+            # ── 6. Credible institution mentions ─────────────────────────
+            institutions = [
+                'reuters', 'ap news', 'associated press', 'bbc', 'new york times',
+                'washington post', 'guardian', 'nytimes', 'bloomberg', 'npr',
+                'who ', 'world health', 'cdc', 'fda', 'nasa', 'un ', 'united nations',
+                'harvard', 'oxford', 'mit ', 'stanford', 'university', 'institute',
+                'journal of', 'nature ', 'science ', 'lancet', 'plos',
+            ]
+            inst_hits = sum(1 for i in institutions if i in tl)
+            institution_score = float(np.clip(inst_hits * 0.12, 0.0, 0.45))
+
+            # ── 7. Conspiracy / Pseudoscience signals ────────────────────
+            conspiracy_terms = [
+                'deep state', 'new world order', 'illuminati', 'globalist',
+                'chemtrail', 'microchip', 'mind control', 'reptilian', 'lizard people',
+                'flat earth', 'moon landing fake', 'crisis actor', 'false flag',
+                'agenda 21', 'great reset', 'depopulation', 'poison', '5g',
+                'vaccine chip', 'bill gates', 'soros', 'rothschild', 'cabal',
+            ]
+            conspiracy_hits = sum(1 for c in conspiracy_terms if c in tl)
+            conspiracy_penalty = float(np.clip(conspiracy_hits * 0.2, 0.0, 0.6))
+
+            # ── 8. Propaganda & Polarizing language ──────────────────────
+            propaganda_terms = [
+                'radical left', 'far left', 'far-left', 'radical right', 'far right',
+                'far-right', 'globalist agenda', 'mainstream media lies', 'fake news media',
+                'lamestream', 'libtard', 'snowflake', 'communist', 'marxist',
+                'satanic', 'evil elites', 'puppet', 'regime', 'tyranny',
+            ]
+            prop_hits = sum(1 for p in propaganda_terms if p in tl)
+            propaganda_penalty = float(np.clip(prop_hits * 0.15, 0.0, 0.5))
+
+            # ── Aggregate credibility score ───────────────────────────────
+            raw = (
+                sourcing_score * 0.28
+                + structure_score * 0.15
+                + claim_density_score * 0.12
+                + institution_score * 0.20
+                - sensationalism_score * 0.20
+                - absolutism_penalty * 0.08
+                - conspiracy_penalty * 0.25
+                - propaganda_penalty * 0.15
+            )
+            credibility_score = float(np.clip(raw + 0.30, 0.0, 1.0))  # +0.30 neutral baseline
+
+            # ── Verdict tier ──────────────────────────────────────────────
+            if credibility_score >= 0.72:
+                tier = 'CREDIBLE'
+                tier_label = 'Credible'
+            elif credibility_score >= 0.50:
+                tier = 'UNCERTAIN'
+                tier_label = 'Uncertain'
+            elif credibility_score >= 0.30:
+                tier = 'SUSPICIOUS'
+                tier_label = 'Suspicious'
+            else:
+                tier = 'FRAUDULENT'
+                tier_label = 'Likely Fraudulent'
+
+            # ── Flags list ────────────────────────────────────────────────
+            flags: List[str] = []
+            if sensationalism_score > 0.35:
+                flags.append('High sensationalism / emotional manipulation')
+            if sourcing_score < 0.25:
+                flags.append('Weak or absent sourcing')
+            if conspiracy_hits > 0:
+                flags.append(f'{conspiracy_hits} conspiracy term(s) detected')
+            if propaganda_hits > 0:
+                flags.append(f'{prop_hits} polarizing language term(s) detected')
+            if caps_ratio > 0.25:
+                flags.append('Excessive ALLCAPS usage')
+            if abs_count >= 3:
+                flags.append('Heavy use of absolute / certain language')
+            if src_neg >= 2:
+                flags.append('Multiple unverified / anonymous sourcing signals')
+
+            positives: List[str] = []
+            if inst_hits > 0:
+                positives.append(f'{inst_hits} credible institution(s) mentioned')
+            if src_pos >= 2:
+                positives.append(f'{src_pos} sourcing / attribution signal(s)')
+            if len(date_patterns) > 0:
+                positives.append(f'{len(date_patterns)} specific date(s) referenced')
+            if len(numbers) > 1:
+                positives.append(f'{len(numbers)} specific figure(s) cited')
+
+            return {
+                'credibility_score': round(credibility_score, 4),
+                'tier': tier,
+                'tier_label': tier_label,
+                'dimensions': {
+                    'sourcing': round(sourcing_score, 3),
+                    'institution_mentions': round(institution_score, 3),
+                    'claim_density': round(claim_density_score, 3),
+                    'structure': round(structure_score, 3),
+                    'sensationalism': round(sensationalism_score, 3),
+                    'absolutism_penalty': round(absolutism_penalty, 3),
+                    'conspiracy_penalty': round(conspiracy_penalty, 3),
+                    'propaganda_penalty': round(propaganda_penalty, 3),
+                },
+                'flags': flags,
+                'positives': positives,
+                'word_count': word_count,
+                'sentence_count': sent_count,
+            }
+        except Exception as exc:
+            logger.warning(f'Credibility report failed: {exc}')
+            return {
+                'credibility_score': 0.5,
+                'tier': 'UNCERTAIN',
+                'tier_label': 'Uncertain',
+                'dimensions': {},
+                'flags': [],
+                'positives': [],
+                'word_count': 0,
+                'sentence_count': 0,
+            }
+
     def get_image_reader_status(self) -> Dict[str, Any]:
         """Expose image-reader availability for screenshot-based verification."""
         try:
@@ -758,6 +961,54 @@ class FakeNewsDetector:
 
         return label, conf
 
+    def _apply_credibility_adjustment(self, label: str, conf: float, meta: Dict[str, Any]) -> Tuple[str, float]:
+        """
+        Secondary credibility nudge using the heuristic credibility report.
+        Does NOT override strong ML or realtime decisions — only applies a
+        mild confidence shift when the report strongly contradicts the current
+        label.  Safe to call when no report is present.
+        """
+        report = meta.get('credibility_report')
+        if not report:
+            return label, conf
+
+        tier = report.get('tier', 'UNCERTAIN')
+        cred = float(report.get('credibility_score', 0.5))
+
+        # Conspiracy / extremely fraudulent content detected — escalate
+        dims = report.get('dimensions', {})
+        conspiracy_pen = float(dims.get('conspiracy_penalty', 0.0))
+        prop_pen = float(dims.get('propaganda_penalty', 0.0))
+        sens = float(dims.get('sensationalism', 0.0))
+
+        if conspiracy_pen >= 0.4:
+            if label == 'REAL':
+                label = 'FAKE'
+                conf = max(conf, 0.82)
+                meta['credibility_impact'] = 'Overridden to FAKE: extreme conspiracy signals detected.'
+                return label, conf
+            else:
+                conf = min(0.99, conf + 0.08)
+                meta['credibility_impact'] = 'Confidence raised: conspiracy signals reinforce FAKE verdict.'
+                return label, conf
+
+        if tier == 'FRAUDULENT' and label == 'REAL':
+            # Credibility report says blatantly fraudulent but ML said REAL —
+            # soften confidence rather than flip outright
+            conf = max(0.45, conf * 0.65)
+            meta['credibility_impact'] = 'Confidence softened: heuristic credibility analysis flagged content as likely fraudulent.'
+        elif tier == 'CREDIBLE' and label == 'FAKE' and cred >= 0.78:
+            # Report says clearly credible but model says FAKE — soften
+            conf = max(0.45, conf * 0.70)
+            meta['credibility_impact'] = 'Confidence softened: content signals are consistent with credible journalism.'
+        elif tier == 'SUSPICIOUS' and label == 'REAL' and sens > 0.5:
+            conf = max(0.48, conf * 0.75)
+            meta['credibility_impact'] = 'Confidence softened: high sensationalism detected in otherwise credible-labelled content.'
+        elif not meta.get('credibility_impact'):
+            meta['credibility_impact'] = f'Content credibility tier: {report.get("tier_label", tier)}.'
+
+        return label, conf
+
     # ── Prediction ─────────────────────────────────────────────────────────────
     def predict(self, text: str, check_realtime: bool = False, use_ensemble: bool = False, requested_models: Optional[List[str]] = None) -> Tuple[str, float, float, Dict]:
         """
@@ -776,13 +1027,17 @@ class FakeNewsDetector:
         translated_text = _coerce_text(translated_text)
         clickbait_score = self._calculate_clickbait_score(translated_text[:200])
 
+        # Aggressive credibility analysis — always computed regardless of model
+        credibility_report = self._compute_credibility_report(translated_text)
+
         meta = {
             'original_language': original_lang,
             'was_translated': was_translated,
             'processed_text': translated_text if was_translated else None,
             'realtime_result': None,
             'ensemble_mode': use_ensemble,
-            'individual_scores': {}
+            'individual_scores': {},
+            'credibility_report': credibility_report,
         }
 
         if check_realtime:
@@ -805,6 +1060,7 @@ class FakeNewsDetector:
             if check_realtime and meta.get('realtime_result'):
                 label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
             label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
+            label, conf = self._apply_credibility_adjustment(label, conf, meta)
             return (label, conf, clickbait_score, meta)
 
         try:
@@ -819,7 +1075,10 @@ class FakeNewsDetector:
             if check_realtime and meta.get('realtime_result'):
                 label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
             label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
-            
+
+            # Apply credibility report as a secondary confidence nudge
+            label, conf = self._apply_credibility_adjustment(label, conf, meta)
+
             # Aggressive cleanup after heavy operation
             if use_ensemble or requested_models:
                 gc.collect()
@@ -1011,29 +1270,23 @@ class FakeNewsDetector:
             return 'REAL', avg_real, results
 
     def _fallback_predict(self, text: str) -> Tuple[str, float]:
-        """Fallback prediction using simple heuristics."""
-        text = _coerce_text(text)
-        text_lower = text.lower()
-        fake_indicators = [
-            'breaking', 'shocking', "you won't believe", 'viral',
-            "they don't want you to know", 'secret', 'conspiracy',
-            'miracle', 'cure', 'hidden truth', 'what happened next',
-        ]
-        real_indicators = [
-            'according to', 'source', 'report', 'study', 'research',
-            'official', 'government', 'university', 'published',
-        ]
-        fake_score = sum(1 for w in fake_indicators if w in text_lower)
-        real_score = sum(1 for w in real_indicators if w in text_lower)
-        total = fake_score + real_score
-        if total == 0:
-            return ('REAL', 0.6)
-        fake_ratio = fake_score / total
-        if fake_ratio > 0.6:
-            return ('FAKE', fake_ratio)
-        elif fake_ratio < 0.3:
-            return ('REAL', 1 - fake_ratio)
-        return ('REAL', 0.55)
+        """
+        Fallback prediction using the credibility report when no ML model is loaded.
+        More aggressive and multi-signal than the old keyword scan.
+        """
+        report = self._compute_credibility_report(_coerce_text(text))
+        score = float(report.get('credibility_score', 0.5))
+        tier = report.get('tier', 'UNCERTAIN')
+        if tier == 'FRAUDULENT':
+            return ('FAKE', float(np.clip(1.0 - score + 0.35, 0.65, 0.97)))
+        if tier == 'SUSPICIOUS':
+            return ('FAKE', float(np.clip(0.75 - score * 0.4, 0.55, 0.80)))
+        if tier == 'CREDIBLE':
+            return ('REAL', float(np.clip(score, 0.60, 0.95)))
+        # UNCERTAIN — mild lean based on score
+        if score >= 0.55:
+            return ('REAL', float(np.clip(score * 0.9, 0.52, 0.72)))
+        return ('FAKE', float(np.clip(0.72 - score, 0.52, 0.72)))
 
     def get_model_info(self) -> Dict:
         """Get information about the currently loaded model."""
