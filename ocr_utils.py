@@ -62,14 +62,15 @@ def _load_image(image_source: Any, image_name: Optional[str] = None) -> Tuple[Im
 
 
 def preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
-    """Normalize an uploaded article image before OCR."""
+    """Normalize an uploaded article image before OCR with aggressive contrast forcing."""
     working = ImageOps.exif_transpose(image)
     if working.mode not in ("RGB", "L"):
         working = working.convert("RGB")
 
     max_dimension = max(working.size) if working.size else 0
-    if max_dimension and max_dimension < 1600:
-        scale = min(2.5, 1600 / float(max_dimension))
+    # Dynamically target up to 2400px to ensure tiny standard news fonts become legible
+    if max_dimension and max_dimension < 2400:
+        scale = min(3.5, 2400 / float(max_dimension))
         resized = (
             max(1, int(working.width * scale)),
             max(1, int(working.height * scale)),
@@ -77,9 +78,16 @@ def preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
         working = working.resize(resized, Image.Resampling.LANCZOS)
 
     grayscale = ImageOps.grayscale(working)
-    grayscale = ImageOps.autocontrast(grayscale, cutoff=2)
-    grayscale = ImageEnhance.Contrast(grayscale).enhance(1.6)
-    grayscale = grayscale.filter(ImageFilter.SHARPEN)
+    
+    # Aggressive macro-filtering to destroy grey and force binary textual layouts
+    grayscale = ImageOps.autocontrast(grayscale, cutoff=5)
+    grayscale = ImageEnhance.Contrast(grayscale).enhance(3.0)
+    grayscale = ImageEnhance.Brightness(grayscale).enhance(1.1)
+    grayscale = ImageEnhance.Sharpness(grayscale).enhance(3.5)
+    
+    # Heavy binarization gate (snap remaining fuzz to pure white or pure black)
+    grayscale = grayscale.point(lambda p: 255 if p > 165 else 0)
+    
     return grayscale
 
 
@@ -256,10 +264,30 @@ def extract_text_from_image(image_source: Any, image_name: Optional[str] = None)
         except Exception:
             logger.debug("Could not remove temporary OCR file %s", temp_image_path, exc_info=True)
 
-    extracted_text = re.sub(r"[ \t]+\n", "\n", str(payload.get("text", ""))).strip()
+    raw_text = str(payload.get("text", ""))
+    
+    # Aggressive Noise Sterilization 
+    sanitized_lines = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        # Drop absolutely empty lines or tiny 1-2 character OCR fragment artifacts
+        if len(line) < 3 and not re.search(r'[A-Za-z0-9]{2,}', line):
+            continue
+        # Drop lines comprised solely of UI widget noise or stray border symbols
+        if re.search(r'^[^a-zA-Z0-9]+$', line):
+            continue
+        # Drop lines where actual text makes up less than 25% of the string (hallucinations)
+        if sum(c.isalnum() for c in line) < len(line) * 0.25:
+            continue
+        sanitized_lines.append(line)
+        
+    extracted_text = " ".join(sanitized_lines) # Condense blocks into smooth paragraph format
+    extracted_text = re.sub(r'\s+', ' ', extracted_text).strip()
+
     payload.update(
         {
             "text": extracted_text,
+            "raw_text": raw_text, # Keep original in payload for forensics if needed
             "backend": status.get("backend", "windows_ocr"),
             "image_name": resolved_name,
             "preprocessed_size": list(prepared_image.size),
