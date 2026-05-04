@@ -1,42 +1,59 @@
-import os
-import sys
+import unittest
+from unittest.mock import patch
 
-# Ensure current directory is in path
-sys.path.insert(0, os.getcwd())
+from fake_news_detector import FakeNewsDetector
 
-print("="*50)
-print("Testing Real-time Integration")
-print("="*50)
 
-try:
-    from fake_news_detector import fake_news_detector
-    print("✅ Fake news detector loaded")
-except Exception as e:
-    print(f"❌ Error loading fake_news_detector: {e}")
-    sys.exit(1)
+class FakeNewsRealtimeIntegrationTests(unittest.TestCase):
+    def _build_detector(self):
+        with patch("fake_news_detector._download_nltk_data", return_value=None), \
+             patch("fake_news_detector.stopwords.words", return_value=[]), \
+             patch.object(FakeNewsDetector, "get_available_models", return_value=[]):
+            return FakeNewsDetector()
 
-test_text = "Scientists have discovered a new planet made entirely of diamonds in the Andromeda galaxy."
-print(f"\nTesting text: {test_text}")
+    def test_prediction_attaches_realtime_and_global_outlet_metadata(self):
+        detector = self._build_detector()
 
-try:
-    label, conf, click_score, meta = fake_news_detector.predict(test_text, check_realtime=True)
-    
-    print(f"\nLabel: {label}")
-    print(f"Confidence: {conf:.2%}")
-    print(f"Clickbait Score: {click_score:.2f}")
-    print(f"Real-time Result present: {meta.get('realtime_result') is not None}")
+        class StubRealtimeVerifier:
+            def verify_claim(self, text):
+                return {
+                    "status": "SUCCESS",
+                    "consensus_score": 0.82,
+                    "contradiction_score": 0.0,
+                    "verdict_code": "VERIFIED_ONLINE",
+                    "sources": [
+                        {
+                            "title": "Reuters confirms the same claim",
+                            "source": "Reuters",
+                            "global_outlet": True,
+                            "global_outlet_name": "Reuters",
+                            "score": 0.84,
+                        }
+                    ],
+                    "global_outlet_comparison": {
+                        "status": "SUPPORTED_BY_GLOBAL_OUTLETS",
+                        "matched_outlet_count": 1,
+                        "strong_match_count": 1,
+                        "contradiction_count": 0,
+                        "coverage_score": 0.84,
+                    },
+                }
 
-    if meta.get('realtime_result'):
-        rt = meta['realtime_result']
-        print(f"\nReal-time Status: {rt.get('status')}")
-        print(f"Real-time Score: {rt.get('consensus_score', 0):.2%}")
-        if rt.get('sources'):
-            print(f"Top Source: {rt['sources'][0]['title'][:100]}")
-            print(f"Source URL: {rt['sources'][0]['url']}")
-    
-    print("\n✅ Test completed successfully!")
-    
-except Exception as e:
-    print(f"\n❌ Error during prediction: {e}")
-    import traceback
-    traceback.print_exc()
+        with patch.object(detector, "get_realtime_verifier", return_value=StubRealtimeVerifier()):
+            label, confidence, _clickbait, meta = detector.predict(
+                "Reuters confirmed that the central claim was accurate.",
+                check_realtime=True,
+            )
+
+        self.assertIn(label, {"REAL", "UNVERIFIED", "FAKE"})
+        self.assertGreaterEqual(confidence, 0.0)
+        self.assertIn("realtime_result", meta)
+        self.assertEqual(
+            meta["realtime_result"]["global_outlet_comparison"]["status"],
+            "SUPPORTED_BY_GLOBAL_OUTLETS",
+        )
+        self.assertIn("final_verdict", meta)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

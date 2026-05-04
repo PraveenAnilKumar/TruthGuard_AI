@@ -63,12 +63,13 @@ def _coerce_text(value: Union[str, List[str], Tuple[str, ...], Any]) -> str:
 
 
 def _download_nltk_data():
-    """Download missing NLTK resources quietly. Safe to call multiple times."""
+    """Prepare optional NLTK resources without blocking offline startup."""
     global _NLTK_SETUP_ATTEMPTED
     if _NLTK_SETUP_ATTEMPTED:
         return
     _NLTK_SETUP_ATTEMPTED = True
 
+    allow_downloads = os.getenv("TRUTHGUARD_ALLOW_NLTK_DOWNLOADS", "0").lower() in {"1", "true", "yes"}
     resources = {
         'tokenizers/punkt': 'punkt',
         'corpora/stopwords': 'stopwords',
@@ -78,6 +79,13 @@ def _download_nltk_data():
         try:
             nltk.data.find(path)
         except LookupError:
+            if not allow_downloads:
+                logger.info(
+                    "NLTK resource %s is missing; continuing with lightweight fallbacks. "
+                    "Set TRUTHGUARD_ALLOW_NLTK_DOWNLOADS=1 to download it.",
+                    resource,
+                )
+                continue
             logger.info(f"Downloading NLTK resource: {resource}")
             try:
                 nltk.download(resource, quiet=True)
@@ -253,7 +261,8 @@ class FakeNewsDetector:
 
         with self._lock:
             available_names = list(self.available_hf_models.keys())
-            target_names = [n for n in (requested_names or available_names) if n in available_names]
+            requested_pool = available_names if requested_names is None else requested_names
+            target_names = [n for n in requested_pool if n in available_names]
             
             # --- UNLOAD UNUSED MODELS ---
             to_unload = [name for name in self._loaded_hf_pipelines if name not in target_names]
@@ -262,6 +271,7 @@ class FakeNewsDetector:
                 del self._loaded_hf_pipelines[name]
             
             if to_unload:
+                self._hf_models_loaded = bool(self._loaded_hf_pipelines)
                 gc.collect()
 
             # --- LOAD REQUESTED MODELS ---
@@ -607,10 +617,16 @@ class FakeNewsDetector:
             'shocking', 'unbelievable', 'miracle', 'revealed', 'finally',
             "you won't believe", 'worst', 'best', 'secret', 'hidden',
             'illegal', 'banned', 'exposed', 'exclusive', 'breaking',
+            'cover-up', 'hoax', 'doctors hate', 'miracle cure',
+            'what happened next', 'before it is deleted', 'media blackout',
         ]
         score += min(sum(1 for t in triggers if t in text_lower) * 0.15, 0.45)
         if '!!!' in text: score += 0.2
         if '???' in text: score += 0.15
+        if re.search(r'\b(share|forward)\b.{0,30}\b(now|before|everyone)\b', text_lower):
+            score += 0.15
+        if re.search(r'\b(secret|miracle|forbidden|suppressed)\b.{0,45}\b(cure|truth|proof|remedy)\b', text_lower):
+            score += 0.15
         words = text.split()
         if len(words) > 5:
             caps = sum(1 for w in words if w.isupper() and len(w) > 1)
@@ -634,6 +650,8 @@ class FakeNewsDetector:
             word_count = max(len(words), 1)
             sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
             sent_count = max(len(sentences), 1)
+            url_count = len(re.findall(r'https?://\S+|www\.\S+', text))
+            direct_quote_count = len(re.findall(r'"[^"]{12,}"|\'[^\']{12,}\'', text))
 
             # ── 1. Sourcing & Attribution signals ────────────────────────
             sourcing_positive = [
@@ -642,16 +660,24 @@ class FakeNewsDetector:
                 'confirmed by', 'verified by', 'cited', 'referenced', 'report by',
                 'journalists', 'investigation found', 'court documents', 'records show',
                 'press release', 'statement from', 'ministry of', 'department of',
+                'news agency', 'filing shows', 'regulator said', 'police said',
+                'hospital said', 'researchers found', 'published in', 'interview with',
             ]
             sourcing_negative = [
                 'anonymous', 'some people say', 'many believe', 'everyone knows',
                 'they say', 'rumor has it', 'insider claims', 'unnamed source',
                 'word on the street', 'i heard', 'apparently', 'supposedly',
                 'sources close to', 'unconfirmed', 'allegedly', 'speculated',
+                'people are saying', 'they will not tell you', 'they are hiding',
+                'mainstream media refuses', 'mainstream media will not report',
             ]
             src_pos = sum(1 for p in sourcing_positive if p in tl)
             src_neg = sum(1 for n in sourcing_negative if n in tl)
-            sourcing_score = float(np.clip((src_pos * 0.15 - src_neg * 0.12 + 0.3), 0.0, 1.0))
+            sourcing_score = float(np.clip(
+                (src_pos * 0.15 + url_count * 0.08 + direct_quote_count * 0.04 - src_neg * 0.12 + 0.3),
+                0.0,
+                1.0,
+            ))
 
             # ── 2. Sensationalism & Emotional manipulation ────────────────
             sensational_triggers = [
@@ -662,6 +688,8 @@ class FakeNewsDetector:
                 'wake up', 'sheeple', 'blind', 'brainwashed', 'censored',
                 'they hide', 'deep state', 'shadow government', 'cover-up',
                 'they don\'t want you', 'hidden truth', 'forbidden knowledge',
+                'media blackout', 'before it is deleted', 'this will be removed',
+                'share before', 'forward this', 'the truth finally exposed',
             ]
             sens_count = sum(1 for t in sensational_triggers if t in tl)
             # Exclamation & caps abuse
@@ -723,6 +751,7 @@ class FakeNewsDetector:
                 'flat earth', 'moon landing fake', 'crisis actor', 'false flag',
                 'agenda 21', 'great reset', 'depopulation', 'poison', '5g',
                 'vaccine chip', 'bill gates', 'soros', 'rothschild', 'cabal',
+                'plandemic', 'climate hoax', 'fake pandemic', 'secret cabal',
             ]
             conspiracy_hits = sum(1 for c in conspiracy_terms if c in tl)
             conspiracy_penalty = float(np.clip(conspiracy_hits * 0.2, 0.0, 0.6))
@@ -733,9 +762,62 @@ class FakeNewsDetector:
                 'far-right', 'globalist agenda', 'mainstream media lies', 'fake news media',
                 'lamestream', 'libtard', 'snowflake', 'communist', 'marxist',
                 'satanic', 'evil elites', 'puppet', 'regime', 'tyranny',
+                'enemy of the people', 'traitors', 'evil cabal', 'the regime media',
             ]
             prop_hits = sum(1 for p in propaganda_terms if p in tl)
             propaganda_penalty = float(np.clip(prop_hits * 0.15, 0.0, 0.5))
+
+            # -- 9. Fraud, implausibility, and share-pressure signals --
+            health_fraud_terms = [
+                'miracle cure', 'secret cure', 'suppressed cure', 'doctors hate',
+                'big pharma', 'cures cancer', 'cure cancer', 'cure diabetes',
+                'instant cure', 'natural remedy cures', 'no side effects',
+                'vaccine kills', 'deadly vaccine', 'detox', 'one weird trick',
+            ]
+            fabricated_authority_terms = [
+                'experts are speechless', 'scientists baffled', 'scientists shocked',
+                'doctors shocked', 'officials are hiding', 'leaked document proves',
+                'secret document proves', 'whistleblower reveals', 'insider reveals',
+            ]
+            urgency_terms = [
+                'share now', 'forward this', 'before it is deleted',
+                'before they delete', 'before it gets removed', 'do not let them censor',
+                'send this to everyone', 'act now', 'wake up before it is too late',
+            ]
+            implausible_terms = [
+                'moon is made of cheese', 'earth is flat', 'lizard people',
+                'reptilian', 'time traveler', 'time travel', 'immortality pill',
+                'aliens built', 'dead returned to life', 'teleportation device',
+                'mind control vaccine', '5g mind control', 'microchip vaccine',
+            ]
+            fraud_hits = sum(1 for p in health_fraud_terms if p in tl)
+            fabricated_authority_hits = sum(1 for p in fabricated_authority_terms if p in tl)
+            urgency_hits = sum(1 for p in urgency_terms if p in tl)
+            implausible_hits = sum(1 for p in implausible_terms if p in tl)
+            fraud_pattern_penalty = float(np.clip(
+                fraud_hits * 0.22 + fabricated_authority_hits * 0.14,
+                0.0,
+                0.7,
+            ))
+            urgency_penalty = float(np.clip(urgency_hits * 0.16, 0.0, 0.45))
+            implausibility_penalty = float(np.clip(implausible_hits * 0.35, 0.0, 0.8))
+
+            evidence_gap_penalty = 0.0
+            if word_count >= 45 and src_pos == 0 and inst_hits == 0 and url_count == 0:
+                evidence_gap_penalty = 0.30
+            elif word_count >= 20 and src_pos == 0 and inst_hits == 0 and url_count == 0:
+                evidence_gap_penalty = 0.18
+
+            severe_pattern_bonus = 0.0
+            if fraud_hits >= 2 or fabricated_authority_hits >= 2:
+                severe_pattern_bonus += 0.22
+            if implausible_hits > 0:
+                severe_pattern_bonus += 0.30
+            if conspiracy_hits >= 2:
+                severe_pattern_bonus += 0.18
+            if urgency_hits > 0 and (fraud_hits > 0 or sens_count > 0):
+                severe_pattern_bonus += 0.12
+            severe_pattern_bonus = float(np.clip(severe_pattern_bonus, 0.0, 0.42))
 
             # ── Aggregate credibility score ───────────────────────────────
             raw = (
@@ -747,8 +829,28 @@ class FakeNewsDetector:
                 - absolutism_penalty * 0.08
                 - conspiracy_penalty * 0.25
                 - propaganda_penalty * 0.15
+                - fraud_pattern_penalty * 0.28
+                - urgency_penalty * 0.16
+                - implausibility_penalty * 0.30
+                - evidence_gap_penalty * 0.18
             )
             credibility_score = float(np.clip(raw + 0.30, 0.0, 1.0))  # +0.30 neutral baseline
+            risk_score = float(np.clip(
+                sensationalism_score * 0.18
+                + absolutism_penalty * 0.10
+                + conspiracy_penalty * 0.22
+                + propaganda_penalty * 0.14
+                + fraud_pattern_penalty * 0.28
+                + urgency_penalty * 0.14
+                + implausibility_penalty * 0.26
+                + evidence_gap_penalty * 0.18
+                + severe_pattern_bonus
+                + max(0.0, 0.35 - sourcing_score) * 0.18
+                - institution_score * 0.12
+                - claim_density_score * 0.05,
+                0.0,
+                1.0,
+            ))
 
             # ── Verdict tier ──────────────────────────────────────────────
             if credibility_score >= 0.72:
@@ -764,6 +866,13 @@ class FakeNewsDetector:
                 tier = 'FRAUDULENT'
                 tier_label = 'Likely Fraudulent'
 
+            if risk_score >= 0.62 and credibility_score < 0.55:
+                tier = 'FRAUDULENT'
+                tier_label = 'Likely Fraudulent'
+            elif risk_score >= 0.44 and tier == 'CREDIBLE':
+                tier = 'UNCERTAIN'
+                tier_label = 'Uncertain'
+
             # ── Flags list ────────────────────────────────────────────────
             flags: List[str] = []
             if sensationalism_score > 0.35:
@@ -772,8 +881,18 @@ class FakeNewsDetector:
                 flags.append('Weak or absent sourcing')
             if conspiracy_hits > 0:
                 flags.append(f'{conspiracy_hits} conspiracy term(s) detected')
-            if propaganda_hits > 0:
+            if prop_hits > 0:
                 flags.append(f'{prop_hits} polarizing language term(s) detected')
+            if fraud_hits > 0:
+                flags.append(f'{fraud_hits} health/scam misinformation pattern(s) detected')
+            if fabricated_authority_hits > 0:
+                flags.append(f'{fabricated_authority_hits} fabricated-authority phrase(s) detected')
+            if urgency_hits > 0:
+                flags.append('Urgent share-pressure language detected')
+            if implausible_hits > 0:
+                flags.append(f'{implausible_hits} implausible claim pattern(s) detected')
+            if evidence_gap_penalty >= 0.18:
+                flags.append('Article makes claims without clear sourcing, links, or institution references')
             if caps_ratio > 0.25:
                 flags.append('Excessive ALLCAPS usage')
             if abs_count >= 3:
@@ -790,9 +909,14 @@ class FakeNewsDetector:
                 positives.append(f'{len(date_patterns)} specific date(s) referenced')
             if len(numbers) > 1:
                 positives.append(f'{len(numbers)} specific figure(s) cited')
+            if url_count > 0:
+                positives.append(f'{url_count} verifiable link(s) included')
+            if direct_quote_count > 0:
+                positives.append(f'{direct_quote_count} direct quote(s) included')
 
             return {
                 'credibility_score': round(credibility_score, 4),
+                'risk_score': round(risk_score, 4),
                 'tier': tier,
                 'tier_label': tier_label,
                 'dimensions': {
@@ -804,6 +928,12 @@ class FakeNewsDetector:
                     'absolutism_penalty': round(absolutism_penalty, 3),
                     'conspiracy_penalty': round(conspiracy_penalty, 3),
                     'propaganda_penalty': round(propaganda_penalty, 3),
+                    'fraud_pattern_penalty': round(fraud_pattern_penalty, 3),
+                    'urgency_penalty': round(urgency_penalty, 3),
+                    'implausibility_penalty': round(implausibility_penalty, 3),
+                    'evidence_gap_penalty': round(evidence_gap_penalty, 3),
+                    'severe_pattern_bonus': round(severe_pattern_bonus, 3),
+                    'risk_score': round(risk_score, 3),
                 },
                 'flags': flags,
                 'positives': positives,
@@ -814,6 +944,7 @@ class FakeNewsDetector:
             logger.warning(f'Credibility report failed: {exc}')
             return {
                 'credibility_score': 0.5,
+                'risk_score': 0.5,
                 'tier': 'UNCERTAIN',
                 'tier_label': 'Uncertain',
                 'dimensions': {},
@@ -945,17 +1076,31 @@ class FakeNewsDetector:
         return bool(normalized) and len(words) <= 18 and len(normalized) <= 180
 
     def _apply_claim_guard(self, label: str, conf: float, meta: Dict[str, Any], text: str) -> Tuple[str, float]:
-        if label != 'REAL' or not self._looks_like_short_claim(text):
+        if not self._looks_like_short_claim(text):
             return label, conf
+
+        report = meta.get('credibility_report') or {}
+        dims = report.get('dimensions') or {}
+        risk = float(report.get('risk_score', 0.0) or 0.0)
+        severe_signal = (
+            float(dims.get('fraud_pattern_penalty', 0.0) or 0.0) >= 0.36
+            or float(dims.get('implausibility_penalty', 0.0) or 0.0) >= 0.35
+            or float(dims.get('conspiracy_penalty', 0.0) or 0.0) >= 0.40
+            or risk >= 0.72
+        )
 
         rt = meta.get('realtime_result')
         if not rt or rt.get('status') != 'SUCCESS':
+            if label == 'FAKE' and severe_signal:
+                return label, conf
             meta['realtime_impact'] = "Short claim could not be corroborated with live reporting, so it was marked unverified."
             return 'UNVERIFIED', min(conf, 0.6)
 
         verdict_code = str(rt.get('verdict_code', 'UNVERIFIED') or 'UNVERIFIED')
         consensus = float(rt.get('consensus_score', 0.0) or 0.0)
         if verdict_code != 'VERIFIED_ONLINE' or consensus < 0.72:
+            if label == 'FAKE' and (severe_signal or verdict_code == 'CONTRADICTED_BY_SOURCES'):
+                return label, conf
             meta['realtime_impact'] = "Short claim was not strongly verified by live reporting, so it was marked unverified."
             return 'UNVERIFIED', min(conf, max(consensus, 0.58))
 
@@ -1010,6 +1155,234 @@ class FakeNewsDetector:
         return label, conf
 
     # ── Prediction ─────────────────────────────────────────────────────────────
+    def _realtime_context(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        rt = meta.get('realtime_result') or {}
+        status = str(rt.get('status', '') or '')
+        verdict_code = str(rt.get('verdict_code', 'UNVERIFIED') or 'UNVERIFIED')
+        consensus = float(rt.get('consensus_score', 0.0) or 0.0)
+        contradiction = float(rt.get('contradiction_score', 0.0) or 0.0)
+        has_result = bool(rt)
+        return {
+            'has_result': has_result,
+            'status': status,
+            'verdict_code': verdict_code,
+            'consensus': consensus,
+            'contradiction': contradiction,
+            'verified': (
+                status == 'SUCCESS'
+                and verdict_code == 'VERIFIED_ONLINE'
+                and consensus >= 0.72
+                and contradiction < 0.18
+            ),
+            'contradicted': (
+                status == 'SUCCESS'
+                and (verdict_code == 'CONTRADICTED_BY_SOURCES' or contradiction >= 0.20)
+            ),
+            'weak': (
+                status == 'NO_RESULTS'
+                or (
+                    status == 'SUCCESS'
+                    and (consensus < 0.42 or verdict_code in {'UNVERIFIED', 'PARTIALLY_SUPPORTED'})
+                )
+            ),
+        }
+
+    def _apply_evidence_fusion(
+        self,
+        label: str,
+        conf: float,
+        clickbait_score: float,
+        meta: Dict[str, Any],
+        text: str,
+    ) -> Tuple[str, float]:
+        """
+        Fuse model output, live verification, and heuristic risk signals.
+        This is deliberately stronger than a simple confidence nudge: weak
+        REAL calls can be downgraded or flipped when multiple fraud signals
+        align and live evidence does not verify the claim.
+        """
+        report = meta.get('credibility_report') or {}
+        dims = report.get('dimensions') or {}
+        tier = str(report.get('tier', 'UNCERTAIN') or 'UNCERTAIN')
+        cred = float(report.get('credibility_score', 0.5) or 0.5)
+        risk = float(report.get('risk_score', max(0.0, 1.0 - cred)) or 0.0)
+        rt_ctx = self._realtime_context(meta)
+
+        fraud = float(dims.get('fraud_pattern_penalty', 0.0) or 0.0)
+        implausible = float(dims.get('implausibility_penalty', 0.0) or 0.0)
+        conspiracy = float(dims.get('conspiracy_penalty', 0.0) or 0.0)
+        urgency = float(dims.get('urgency_penalty', 0.0) or 0.0)
+        sensationalism = float(dims.get('sensationalism', 0.0) or 0.0)
+        evidence_gap = float(dims.get('evidence_gap_penalty', 0.0) or 0.0)
+
+        severe_signal = (
+            fraud >= 0.36
+            or implausible >= 0.35
+            or conspiracy >= 0.40
+            or (fraud + urgency + sensationalism) >= 0.72
+            or (risk >= 0.66 and evidence_gap >= 0.18)
+        )
+        high_risk = (
+            risk >= 0.48
+            or tier == 'FRAUDULENT'
+            or (tier == 'SUSPICIOUS' and (clickbait_score >= 0.45 or sensationalism >= 0.32))
+        )
+
+        if rt_ctx['verified'] and not severe_signal:
+            if label == 'FAKE':
+                label = 'REAL'
+                conf = max(conf * 0.65, rt_ctx['consensus'])
+            else:
+                conf = min(0.98, max(conf, 0.72 + rt_ctx['consensus'] * 0.20))
+            meta['evidence_fusion'] = 'Live source consensus outweighed weaker misinformation signals.'
+            return label, conf
+
+        if rt_ctx['contradicted']:
+            label = 'FAKE'
+            conf = max(conf, min(0.97, 0.76 + rt_ctx['contradiction'] * 0.35 + risk * 0.10))
+            meta['evidence_fusion'] = 'Live source contradiction was treated as decisive evidence.'
+            return label, conf
+
+        if severe_signal and not rt_ctx['verified']:
+            label = 'FAKE'
+            conf = max(conf, min(0.96, 0.78 + risk * 0.18 + clickbait_score * 0.08))
+            meta['evidence_fusion'] = 'Severe fraud or implausibility signals overrode weaker model evidence.'
+            return label, conf
+
+        if high_risk and not rt_ctx['verified']:
+            if label == 'UNVERIFIED' and self._looks_like_short_claim(text) and rt_ctx['weak'] and not severe_signal:
+                meta.setdefault('evidence_fusion', 'Weak live corroboration kept this short claim in the unverified category.')
+                return label, conf
+            if label in {'REAL', 'UNVERIFIED'}:
+                label = 'FAKE'
+                conf = max(conf if label == 'FAKE' else 0.0, min(0.92, 0.70 + risk * 0.25 + clickbait_score * 0.08))
+                meta['evidence_fusion'] = 'Multiple risk signals outweighed the original weak credible reading.'
+            else:
+                conf = min(0.96, max(conf, 0.68 + risk * 0.24))
+                meta['evidence_fusion'] = 'Risk signals reinforced the fake-news verdict.'
+            return label, conf
+
+        if label == 'REAL' and rt_ctx['weak'] and (risk >= 0.34 or cred < 0.50):
+            label = 'UNVERIFIED'
+            conf = min(conf, 0.64)
+            meta['evidence_fusion'] = 'Weak live corroboration and mixed credibility signals prevented a REAL verdict.'
+            return label, conf
+
+        meta.setdefault('evidence_fusion', 'Model, heuristic, and live-evidence signals were consistent enough to keep the verdict.')
+        return label, conf
+
+    def _build_user_reply(
+        self,
+        label: str,
+        conf: float,
+        clickbait_score: float,
+        meta: Dict[str, Any],
+        text: str,
+    ) -> Dict[str, Any]:
+        report = meta.get('credibility_report') or {}
+        flags = list(report.get('flags') or [])
+        positives = list(report.get('positives') or [])
+        tier_label = report.get('tier_label', report.get('tier', 'Uncertain'))
+        risk = float(report.get('risk_score', 0.5) or 0.5)
+        cred = float(report.get('credibility_score', 0.5) or 0.5)
+        rt_ctx = self._realtime_context(meta)
+
+        if label == 'FAKE':
+            summary = (
+                f"I would not trust this as written. TruthGuard rates it likely fake or misleading "
+                f"with {conf:.0%} confidence."
+            )
+        elif label == 'UNVERIFIED':
+            summary = (
+                "I cannot verify this strongly enough to call it real. Treat it as unverified "
+                "until a reliable source confirms the key claim."
+            )
+        elif conf < 0.65:
+            summary = (
+                f"This leans credible, but confidence is modest at {conf:.0%}. I would treat it as plausible, "
+                "not proven, until the original source and key details are checked."
+            )
+        else:
+            summary = (
+                f"This looks credible overall, with {conf:.0%} confidence, but it should still be checked "
+                "against the original source for high-stakes decisions."
+            )
+
+        reasons: List[str] = []
+        if rt_ctx['contradicted']:
+            reasons.append('Live reporting matched the topic but contradicted important details in the claim.')
+        elif rt_ctx['verified']:
+            reasons.append('Live reporting from credible sources strongly corroborated the claim.')
+        elif rt_ctx['has_result'] and rt_ctx['weak']:
+            reasons.append('Live news search found weak or incomplete corroboration.')
+
+        if meta.get('evidence_fusion'):
+            reasons.append(str(meta['evidence_fusion']))
+        if meta.get('credibility_impact'):
+            reasons.append(str(meta['credibility_impact']))
+
+        if flags:
+            reasons.extend(flags[:3])
+        elif positives:
+            reasons.extend(positives[:3])
+
+        if clickbait_score >= 0.55:
+            reasons.append(f'Clickbait pressure is high ({clickbait_score:.2f}/1.00), which often appears in misinformation.')
+
+        if not reasons:
+            reasons.append(f'Credibility tier is {tier_label} with {cred:.0%} credibility and {risk:.0%} risk.')
+
+        if label == 'FAKE':
+            next_steps = [
+                'Do not share it until the original source, date, and primary evidence are verified.',
+                'Look for the same claim in reputable outlets or official records, not reposts or screenshots.',
+            ]
+        elif label == 'UNVERIFIED':
+            next_steps = [
+                'Ask for a primary source or a reputable outlet carrying the same specific claim.',
+                'Check whether the headline changed key details such as dates, numbers, names, or locations.',
+            ]
+        else:
+            next_steps = [
+                'Open the cited source and confirm that the headline matches the body of the article.',
+                'For medical, legal, financial, or election claims, verify against an official source too.',
+            ]
+
+        return {
+            'summary': summary,
+            'reasons': reasons[:6],
+            'next_steps': next_steps,
+            'credibility_score': round(cred, 4),
+            'risk_score': round(risk, 4),
+            'tier': tier_label,
+        }
+
+    def _finalize_prediction(
+        self,
+        label: str,
+        conf: float,
+        clickbait_score: float,
+        meta: Dict[str, Any],
+        translated_text: str,
+        check_realtime: bool,
+    ) -> Tuple[str, float, Dict[str, Any]]:
+        meta['model_verdict'] = {
+            'label': label,
+            'confidence': round(float(conf), 4),
+        }
+        if check_realtime and meta.get('realtime_result'):
+            label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
+        label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
+        label, conf = self._apply_credibility_adjustment(label, conf, meta)
+        label, conf = self._apply_evidence_fusion(label, conf, clickbait_score, meta, translated_text)
+        conf = float(np.clip(conf, 0.0, 0.99))
+        meta['final_verdict'] = {
+            'label': label,
+            'confidence': round(conf, 4),
+        }
+        meta['user_reply'] = self._build_user_reply(label, conf, clickbait_score, meta, translated_text)
+        return label, conf, meta
+
     def predict(self, text: str, check_realtime: bool = False, use_ensemble: bool = False, requested_models: Optional[List[str]] = None) -> Tuple[str, float, float, Dict]:
         """
         Predict if text is fake news.
@@ -1044,7 +1417,7 @@ class FakeNewsDetector:
             try:
                 realtime_verifier = self.get_realtime_verifier()
                 if realtime_verifier is not None:
-                    meta['realtime_result'] = realtime_verifier.verify_claim(translated_text[:300])
+                    meta['realtime_result'] = realtime_verifier.verify_claim(translated_text[:6000])
             except Exception as e:
                 logger.error(f"Real-time verification during predict failed: {e}")
 
@@ -1057,10 +1430,14 @@ class FakeNewsDetector:
         ):
             logger.warning("No trained model loaded. Using fallback.")
             label, conf = self._fallback_predict(translated_text)
-            if check_realtime and meta.get('realtime_result'):
-                label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
-            label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
-            label, conf = self._apply_credibility_adjustment(label, conf, meta)
+            label, conf, meta = self._finalize_prediction(
+                label,
+                conf,
+                clickbait_score,
+                meta,
+                translated_text,
+                check_realtime,
+            )
             return (label, conf, clickbait_score, meta)
 
         try:
@@ -1072,12 +1449,14 @@ class FakeNewsDetector:
             else:
                 label, conf = self._predict_traditional(translated_text)
 
-            if check_realtime and meta.get('realtime_result'):
-                label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
-            label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
-
-            # Apply credibility report as a secondary confidence nudge
-            label, conf = self._apply_credibility_adjustment(label, conf, meta)
+            label, conf, meta = self._finalize_prediction(
+                label,
+                conf,
+                clickbait_score,
+                meta,
+                translated_text,
+                check_realtime,
+            )
 
             # Aggressive cleanup after heavy operation
             if use_ensemble or requested_models:
@@ -1087,9 +1466,14 @@ class FakeNewsDetector:
         except Exception as e:
             logger.error(f"Prediction error: {e}")
             label, conf = self._fallback_predict(translated_text)
-            if check_realtime and meta.get('realtime_result'):
-                label, conf = self._apply_realtime_adjustment(label, conf, meta, translated_text)
-            label, conf = self._apply_claim_guard(label, conf, meta, translated_text)
+            label, conf, meta = self._finalize_prediction(
+                label,
+                conf,
+                clickbait_score,
+                meta,
+                translated_text,
+                check_realtime,
+            )
             return (label, conf, clickbait_score, meta)
 
     def _predict_traditional(self, text: str) -> Tuple[str, float]:
@@ -1276,14 +1660,17 @@ class FakeNewsDetector:
         """
         report = self._compute_credibility_report(_coerce_text(text))
         score = float(report.get('credibility_score', 0.5))
+        risk = float(report.get('risk_score', max(0.0, 1.0 - score)) or 0.0)
         tier = report.get('tier', 'UNCERTAIN')
         if tier == 'FRAUDULENT':
-            return ('FAKE', float(np.clip(1.0 - score + 0.35, 0.65, 0.97)))
+            return ('FAKE', float(np.clip(0.66 + risk * 0.30 + (1.0 - score) * 0.12, 0.68, 0.97)))
         if tier == 'SUSPICIOUS':
-            return ('FAKE', float(np.clip(0.75 - score * 0.4, 0.55, 0.80)))
+            return ('FAKE', float(np.clip(0.58 + risk * 0.28 + (0.55 - score) * 0.12, 0.55, 0.86)))
         if tier == 'CREDIBLE':
             return ('REAL', float(np.clip(score, 0.60, 0.95)))
         # UNCERTAIN — mild lean based on score
+        if risk >= 0.48:
+            return ('FAKE', float(np.clip(0.58 + risk * 0.25, 0.58, 0.78)))
         if score >= 0.55:
             return ('REAL', float(np.clip(score * 0.9, 0.52, 0.72)))
         return ('FAKE', float(np.clip(0.72 - score, 0.52, 0.72)))

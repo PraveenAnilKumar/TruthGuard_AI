@@ -1,58 +1,41 @@
-# test_toxicity.py
-import sys
-import os
+import unittest
 
-# Add current directory to path
-sys.path.insert(0, os.getcwd())
+from toxicity_detector import ToxicityDetector
+from toxicity_viz import ToxicityVisualizer
 
-print("="*50)
-print("Testing Toxicity Modules")
-print("="*50)
 
-print("\nTesting toxicity_detector import...")
-try:
-    from toxicity_detector import ToxicityDetector, toxicity_detector
-    print("✅ toxicity_detector imported successfully")
-except Exception as e:
-    print(f"❌ Error importing toxicity_detector: {e}")
-    import traceback
-    traceback.print_exc()
+class ToxicitySmokeTests(unittest.TestCase):
+    def test_keyword_fallback_prediction_returns_explanation(self):
+        detector = ToxicityDetector(use_ensemble=False)
 
-print("\nTesting toxicity_viz import...")
-try:
-    from toxicity_viz import ToxicityVisualizer, toxicity_viz
-    print("✅ toxicity_viz imported successfully")
-except Exception as e:
-    print(f"❌ Error importing toxicity_viz: {e}")
-    import traceback
-    traceback.print_exc()
+        is_toxic, confidence, categories, explanation, meta = detector.predict(
+            "You are such an idiot and a stupid loser."
+        )
 
-# Test creating detector
-print("\nTesting ToxicityDetector creation...")
-try:
-    detector = ToxicityDetector(use_ensemble=True)
-    print("✅ ToxicityDetector created successfully")
-    print(f"   Model trained: {detector.is_trained}")
-    print(f"   Available models: {list(detector.models.keys()) if detector.models else 'None'}")
-except Exception as e:
-    print(f"❌ Error creating ToxicityDetector: {e}")
-    import traceback
-    traceback.print_exc()
+        self.assertIsInstance(is_toxic, bool)
+        self.assertGreaterEqual(confidence, 0.0)
+        self.assertLessEqual(confidence, 1.0)
+        self.assertIsInstance(categories, dict)
+        self.assertIsInstance(explanation, dict)
+        self.assertIn("reasons", explanation)
+        self.assertIsInstance(meta, dict)
 
-# Test prediction
-print("\nTesting prediction...")
-try:
-    test_text = "You are such an idiot!"
-    is_toxic, conf, cats, explanation, meta = detector.predict(test_text)
-    print(f"   Text: {test_text}")
-    print(f"   Is Toxic: {is_toxic}")
-    print(f"   Confidence: {conf:.2%}")
-    print("✅ Prediction successful")
-except Exception as e:
-    print(f"❌ Error during prediction: {e}")
-    import traceback
-    traceback.print_exc()
+    def test_visualizer_generates_highlight_html(self):
+        explanation = {
+            "word_impact": {
+                "idiot": {"score": 0.85},
+                "stupid": {"score": 0.70},
+            },
+        }
 
-print("\n" + "="*50)
-print("Test complete!")
-print("="*50)
+        html = ToxicityVisualizer.render_toxic_highlights(
+            "That was an idiot and stupid remark.",
+            explanation,
+        )
+
+        self.assertIn("<span", html)
+        self.assertIn("idiot", html.lower())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

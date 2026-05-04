@@ -1,44 +1,37 @@
-import logging
-import sys
+import unittest
+from unittest.mock import patch
+
 from fake_news_detector import FakeNewsDetector
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-def test_robust_prediction():
-    print("=== Testing FakeNewsDetector Robustness ===")
-    detector = FakeNewsDetector()
-    
-    # Test 1: String input (Normal)
-    print("\nTest 1: Normal string input")
-    try:
-        score = detector._calculate_clickbait_score("Is this clickbait?")
-        print(f"✅ String score: {score}")
-    except Exception as e:
-        print(f"❌ String failed: {e}")
+class FakeNewsRobustPredictionTests(unittest.TestCase):
+    def _build_detector(self):
+        with patch("fake_news_detector._download_nltk_data", return_value=None), \
+             patch("fake_news_detector.stopwords.words", return_value=[]), \
+             patch.object(FakeNewsDetector, "get_available_models", return_value=[]):
+            return FakeNewsDetector()
 
-    # Test 2: List input (The reported bug)
-    print("\nTest 2: List input (simulating problematic translator output)")
-    try:
-        # Previously this would fail with 'list' object has no attribute 'strip'
-        score = detector._calculate_clickbait_score(["This", "is", "a", "list", "?"])
-        print(f"✅ List score: {score}")
-    except Exception as e:
-        print(f"❌ List failed: {e}")
+    def test_clickbait_score_accepts_string_and_sequence_inputs(self):
+        detector = self._build_detector()
 
-    # Test 3: Traditional prediction with list-y input (mocked)
-    print("\nTest 3: Traditional prediction robustness")
-    # We don't necessarily need a trained model here if we just want to see it catch the error
-    # but let's try calling it on a known empty model state
-    detector.model = None 
-    try:
-        label, conf = detector._predict_traditional("Some text")
-        print(f"✅ Prediction fallback handled: {label} ({conf})")
-    except Exception as e:
-        print(f"❌ Prediction failed: {e}")
+        string_score = detector._calculate_clickbait_score("Is this clickbait?")
+        list_score = detector._calculate_clickbait_score(["This", "is", "a", "list", "?"])
 
-    print("\n=== Robustness tests complete ===")
+        self.assertGreaterEqual(string_score, 0.0)
+        self.assertLessEqual(string_score, 1.0)
+        self.assertGreaterEqual(list_score, 0.0)
+        self.assertLessEqual(list_score, 1.0)
+
+    def test_traditional_prediction_falls_back_without_loaded_model(self):
+        detector = self._build_detector()
+        detector.model = None
+
+        label, confidence = detector._predict_traditional("Some text")
+
+        self.assertIn(label, {"REAL", "FAKE"})
+        self.assertGreaterEqual(confidence, 0.0)
+        self.assertLessEqual(confidence, 1.0)
+
 
 if __name__ == "__main__":
-    test_robust_prediction()
+    unittest.main(verbosity=2)

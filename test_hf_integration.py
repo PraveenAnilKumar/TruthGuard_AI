@@ -1,49 +1,29 @@
+import unittest
+from unittest.mock import patch
+
 import numpy as np
-import cv2
-import sys
-import os
 
-# Add current directory to path
-sys.path.insert(0, os.getcwd())
+from deepfake_detector_advanced import DeepfakeDetectorAdvanced
 
-def test_hf_integration():
-    print("="*50)
-    print("Testing HuggingFace Integration")
-    print("="*50)
-    
-    print("\nInitializing detector...")
-    try:
-        from deepfake_detector_advanced import DeepfakeDetectorAdvanced
+
+class DeepfakeHFIntegrationTests(unittest.TestCase):
+    def test_hf_deepfake_requests_fall_back_when_remote_models_are_disabled(self):
         detector = DeepfakeDetectorAdvanced()
-        print("✅ Detector initialized")
-    except Exception as e:
-        print(f"❌ Failed to initialize detector: {e}")
-        return
-    
-    print(f"\nAvailable HF models: {list(detector.available_hf_models.keys())}")
-    
-    # Create a dummy image (random noise)
-    dummy_img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-    
-    test_models = ["HF_Transformer_V1", "HF_Transformer_V2", "SDXL_Detector"]
-    
-    for model_name in test_models:
-        print(f"\n--- Testing {model_name} ---")
-        try:
-            # We use detect_deepfake_ensemble which will lazy-load the model
-            res = detector.detect_deepfake_ensemble(dummy_img, requested_models=[model_name])
-            print(f"Result: {res.get('is_deepfake')}, Score: {res.get('ensemble_score')}")
-            
-            if model_name in detector.model_names:
-                print(f"✅ {model_name} successfully loaded and scored")
-            else:
-                print(f"❌ {model_name} failed to load")
-        except Exception as e:
-            print(f"❌ Error during testing {model_name}: {e}")
-    
-    print("\n" + "="*50)
-    print("Test complete!")
-    print("="*50)
+        dummy_img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+
+        with patch.object(detector, "_ensure_hf_loaded", return_value=None), \
+             patch.object(detector, "_get_loaded_model_subset", return_value=([], [])), \
+             patch.object(detector, "detect_faces", return_value=[]):
+            result = detector.detect_deepfake_ensemble(
+                dummy_img,
+                requested_models=["HF_Transformer_V1"],
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertIn("is_deepfake", result)
+        self.assertIn("ensemble_score", result)
+        self.assertFalse(detector.enable_hf_model)
+
 
 if __name__ == "__main__":
-    test_hf_integration()
+    unittest.main(verbosity=2)

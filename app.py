@@ -646,6 +646,7 @@ def render_live_news_comparison(rt_result, claim_text):
     shown_sources = sources[:5]
     for source in shown_sources:
         source_name = source.get("source") or source.get("domain") or "Unknown source"
+        source_tier = source.get("source_tier") or ("Global credible outlet" if source.get("global_outlet") else "General source")
         title = source.get("title") or "Untitled article"
         snippet = source.get("evidence_snippet") or "No article excerpt was extracted for this result, but the headline still matched the claim."
         published = source.get("published") or "Publication time unavailable"
@@ -661,6 +662,7 @@ def render_live_news_comparison(rt_result, claim_text):
                         <span class="live-news-pill">Match {source.get('score', 0.0):.0%}</span>
                         <span class="live-news-pill">Credibility {source.get('credibility_score', 0.0):.0%}</span>
                         <span class="live-news-pill">Body {source.get('body_similarity', 0.0):.0%}</span>
+                        <span class="live-news-pill">{escape(source_tier)}</span>
                     </div>
                 </div>
                 <div class="live-news-title">{escape(_compact_text(title, 220))}</div>
@@ -682,11 +684,62 @@ def render_live_news_comparison(rt_result, claim_text):
             "Match Score": round(source.get("score", 0.0), 3),
             "Text Similarity": round(source.get("pure_similarity", 0.0), 3),
             "Credibility": round(source.get("credibility_score", 0.0), 3),
+            "Outlet Tier": source.get("source_tier", ""),
+            "Global Outlet": source.get("global_outlet_name", ""),
             "Body Match": round(source.get("body_similarity", 0.0), 3),
             "Published": source.get("published", ""),
         })
     with st.expander("Technical Match Breakdown"):
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def render_global_outlet_comparison(rt_result):
+    """Show how the claim compares against configured credible global outlets."""
+    comparison = (rt_result or {}).get("global_outlet_comparison") or {}
+    if not comparison:
+        return
+
+    st.markdown("### Global Outlet Comparison")
+    message = str(comparison.get("message") or "").strip()
+    if message:
+        st.caption(message)
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Outlets Matched", int(comparison.get("matched_outlet_count", 0) or 0))
+    with m2:
+        st.metric("Strong Matches", int(comparison.get("strong_match_count", 0) or 0))
+    with m3:
+        st.metric("Contradictions", int(comparison.get("contradiction_count", 0) or 0))
+    with m4:
+        st.metric("Coverage Score", f"{float(comparison.get('coverage_score', 0.0) or 0.0):.0%}")
+
+    matched_outlets = comparison.get("matched_outlets") or []
+    if matched_outlets:
+        st.caption("Matched outlets: " + ", ".join(str(name) for name in matched_outlets[:8]))
+
+    top_matches = comparison.get("top_matches") or []
+    if top_matches:
+        rows = []
+        for item in top_matches:
+            rows.append({
+                "Outlet": item.get("outlet", ""),
+                "Headline": item.get("title", ""),
+                "Match": round(float(item.get("score", 0.0) or 0.0), 3),
+                "Similarity": round(float(item.get("similarity", 0.0) or 0.0), 3),
+                "Credibility": round(float(item.get("credibility", 0.0) or 0.0), 3),
+                "Stance": item.get("stance_status", "neutral"),
+            })
+        with st.expander("Credible Outlet Matches", expanded=False):
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    else:
+        st.info("No configured global outlet carried a strong matching report for this claim.")
+
+    outlet_queries = (rt_result or {}).get("global_outlet_queries") or []
+    if outlet_queries:
+        with st.expander("Outlet-scoped search queries", expanded=False):
+            for query in outlet_queries[:6]:
+                st.code(str(query), language="text")
 
 
 def render_article_match_browser(
@@ -1352,16 +1405,33 @@ def render_realtime_verdict_card(res: dict, claim_text: str):
             top_cred = max((s.get('credibility_score', 0) for s in sources), default=0.0)
             st.metric("Top Source Credibility", f"{top_cred:.0%}")
 
+    cleaned_claim = str(res.get("cleaned_claim") or "").strip()
+    original_claim = str(res.get("original_claim") or claim_text or "").strip()
+    claim_was_cleaned = bool(res.get("claim_was_cleaned")) and cleaned_claim and cleaned_claim != original_claim
+    if claim_was_cleaned:
+        st.info("The verifier cleaned noisy OCR/article text into a concise factual claim before checking live sources.")
+
     # Claim display
     if claim_text:
         with st.expander("📌 Claim / Extracted Text Used", expanded=False):
+            if claim_was_cleaned:
+                st.text_area(
+                    "Cleaned claim used",
+                    value=cleaned_claim,
+                    height=90,
+                    disabled=True,
+                    key=f"rt_cleaned_claim_{hash(cleaned_claim) & 0xFFFF}",
+                )
             st.text_area(
-                "Input claim",
-                value=claim_text,
-                height=90,
+                "Raw input / OCR text",
+                value=original_claim or claim_text,
+                height=140 if claim_was_cleaned else 90,
                 disabled=True,
                 key=f"rt_verdict_claim_{hash(claim_text) & 0xFFFF}",
             )
+            source_urls = res.get("source_urls") or []
+            if source_urls:
+                st.caption("Source URL(s): " + ", ".join(str(url) for url in source_urls[:3]))
 
     st.caption(f"Verdict code: `{verdict_code}` | {res.get('message', '')}")
 
@@ -1397,6 +1467,12 @@ def render_credibility_report_panel(credibility_report: dict):
 
         # Dimension bars
         dim_labels = {
+            'fraud_pattern_penalty': ('Scam / Health Fraud Patterns', False),
+            'urgency_penalty': ('Share Pressure', False),
+            'implausibility_penalty': ('Implausible Claim Patterns', False),
+            'evidence_gap_penalty': ('Evidence Gap', False),
+            'severe_pattern_bonus': ('Severe Pattern Bonus', False),
+            'risk_score': ('Overall Risk', False),
             'sourcing': ('🔗 Sourcing Quality', True),
             'institution_mentions': ('🏦 Institution Mentions', True),
             'claim_density': ('📊 Specific Claims / Figures', True),
@@ -1441,6 +1517,35 @@ def render_credibility_report_panel(credibility_report: dict):
         sc = credibility_report.get('sentence_count', 0)
         if wc:
             st.caption(f"Analysed: {wc} words across {sc} sentence(s).")
+
+
+def render_fake_news_reply_panel(meta: dict):
+    reply = (meta or {}).get("user_reply") or {}
+    if not reply:
+        return
+
+    summary = str(reply.get("summary") or "").strip()
+    reasons = [str(item) for item in (reply.get("reasons") or []) if str(item).strip()]
+    next_steps = [str(item) for item in (reply.get("next_steps") or []) if str(item).strip()]
+    tier = str(reply.get("tier") or "Uncertain")
+    risk_score = float(reply.get("risk_score", 0.5) or 0.5)
+
+    st.markdown('<div class="glass-card" style="border-left:4px solid #6366f1;">', unsafe_allow_html=True)
+    st.markdown("### Analyst Reply")
+    if summary:
+        st.write(summary)
+    st.caption(f"Credibility tier: {tier} | Risk score: {risk_score:.0%}")
+
+    if reasons:
+        st.markdown("**Why this verdict:**")
+        for reason in reasons[:6]:
+            st.markdown(f"- {reason}")
+
+    if next_steps:
+        st.markdown("**What to do next:**")
+        for step in next_steps[:3]:
+            st.markdown(f"- {step}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def render_sentiment_result_panel(result):
@@ -3242,6 +3347,7 @@ elif st.session_state.page == "Fake News Detection":
         if st.session_state.fn_verification_result:
             res = st.session_state.fn_verification_result
             _rt_display_claim = res.get("_source_claim") or claim_text
+            _rt_compare_claim = res.get("cleaned_claim") or _rt_display_claim
             st.markdown("---")
 
             # Show OCR panel if the result came from an image
@@ -3251,9 +3357,10 @@ elif st.session_state.page == "Fake News Detection":
 
             # Full verdict prediction card
             render_realtime_verdict_card(res, _rt_display_claim)
+            render_global_outlet_comparison(res)
 
             if res['status'] != 'NO_RESULTS':
-                render_live_news_comparison(res, _rt_display_claim)
+                render_live_news_comparison(res, _rt_compare_claim)
 
     elif method == "📝 Direct Verification":
         if st.session_state.clear_fn:
@@ -3418,6 +3525,8 @@ elif st.session_state.page == "Fake News Detection":
             if res.get('meta') and res['meta'].get('ocr'):
                 render_ocr_result_panel(res['meta']['ocr'], section_title="Image Reader")
 
+            render_fake_news_reply_panel(res.get('meta') or {})
+
             # Credibility heuristic breakdown
             _fn_cred_report = (res.get('meta') or {}).get('credibility_report')
             if _fn_cred_report:
@@ -3429,6 +3538,7 @@ elif st.session_state.page == "Fake News Detection":
                 st.caption(f"💡 Credibility adjustment: {_fn_cred_impact}")
 
             rt = res.get('meta', {}).get('realtime_result') if res.get('meta') else None
+            rt_compare_text = (rt or {}).get('cleaned_claim') or res.get('text', '')
 
             if (
                 res.get('source_type') == 'image'
@@ -3445,17 +3555,21 @@ elif st.session_state.page == "Fake News Detection":
                     intro_text="These are the live articles matched against the text extracted from your uploaded article image.",
                 )
                 with st.expander("Image Match Details"):
-                    render_live_news_comparison(rt, res.get('text', ''))
+                    render_live_news_comparison(rt, rt_compare_text)
                 st.markdown('</div>', unsafe_allow_html=True)
 
             if rt:
                 st.markdown('<div class="glass-card" style="border-left: 4px solid #3b82f6;">', unsafe_allow_html=True)
                 impact = res['meta'].get('realtime_impact')
+                if rt.get('claim_was_cleaned') and rt.get('cleaned_claim'):
+                    st.info("Real-time verification used a cleaned factual claim extracted from the submitted article text.")
+                    st.caption(f"Cleaned claim: {rt.get('cleaned_claim')}")
                 if impact:
                     st.success(f"⚖️ **Consensus Impact:** {impact}")
                 st.markdown("### 📡 Real-time Factual Consensus")
                 if rt['status'] == 'NO_RESULTS':
                     st.info("No mainstream news reports were found matching this specific claim.")
+                    render_global_outlet_comparison(rt)
                 else:
                     consensus = rt['consensus_score']
                     verdict_code = rt.get('verdict_code', 'N/A')
@@ -3471,6 +3585,7 @@ elif st.session_state.page == "Fake News Detection":
                             st.error(f"🚨 **{verdict_code.replace('_', ' ')}**")
                     st.progress(consensus)
                     st.caption(rt['message'])
+                    render_global_outlet_comparison(rt)
                     if rt.get('sources'):
                         intro_text = "Review the matched live articles used to support this fake-news decision."
                         section_title = "Matching Articles"
@@ -3483,7 +3598,7 @@ elif st.session_state.page == "Fake News Detection":
                                 intro_text=intro_text,
                             )
                             with st.expander(details_label):
-                                render_live_news_comparison(rt, res.get('text', ''))
+                                render_live_news_comparison(rt, rt_compare_text)
                         else:
                             st.caption("Matching articles from the extracted image text are shown above.")
                 st.markdown('</div>', unsafe_allow_html=True)

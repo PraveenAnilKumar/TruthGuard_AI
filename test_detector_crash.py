@@ -1,34 +1,21 @@
-import os
-import sys
-import logging
+import unittest
+from pathlib import Path
 
-# Set up logging to match app
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from fake_news_detector import FakeNewsDetector
 
-def test_load():
-    try:
-        logger.info("Importing FakeNewsDetector...")
-        from fake_news_detector import FakeNewsDetector
-        
-        logger.info("Initializing FakeNewsDetector...")
+
+class FakeNewsModelLoadTests(unittest.TestCase):
+    def test_transformer_model_registration_does_not_crash_when_present(self):
+        model_path = Path("models/fake_news/transformer_distilbert-base-uncased_20260306_171509")
+        if not model_path.exists():
+            self.skipTest(f"Optional transformer model not present: {model_path}")
+
         detector = FakeNewsDetector()
-        
-        logger.info("Attempting to load transformer model...")
-        model_path = r"models/fake_news/transformer_distilbert-base-uncased_20260306_171509"
-        
-        if not os.path.exists(model_path):
-            logger.error(f"Model path does not exist: {model_path}")
-            return
-            
-        success = detector.load_transformer_model(model_path)
-        if success:
-            logger.info("✅ Transformer model loaded successfully in test script")
-        else:
-            logger.error("❌ Transformer model load failed in test script")
-            
-    except Exception as e:
-        logger.exception(f"CRASH in test script: {e}")
+        loaded = detector.load_transformer_model(str(model_path))
+
+        self.assertTrue(loaded)
+        self.assertIsNotNone(detector.transformer_backend)
+
 
 if __name__ == "__main__":
-    test_load()
+    unittest.main(verbosity=2)
